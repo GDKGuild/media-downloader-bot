@@ -1,0 +1,16 @@
+node_modules/
+dist/
+downloads/
+.env
+*.log
+media_hashes.db
+media_hashes.db-shm
+media_hashes.db-wal
+archive/
+archive2/
+.renamed-db/
+logs/
+*.md
+add-timestamps-report.*
+*.ps1
+*.jsonl
