@@ -56,6 +56,14 @@ export const data = new SlashCommandBuilder()
       .setDescription('Seconds to scan back (temporary)')
       .setRequired(false)
       .setMinValue(1))
+  .addStringOption(option =>
+    option.setName('after')
+      .setDescription('Download messages after this date (YYYY-MM-DD)')
+      .setRequired(false))
+  .addStringOption(option =>
+    option.setName('before')
+      .setDescription('Download messages before this date (YYYY-MM-DD)')
+      .setRequired(false))
   .addIntegerOption(option =>
     option.setName('concurrency')
       .setDescription('Number of channels to process at once (default: 3)')
@@ -187,6 +195,37 @@ export async function execute(
   const effectiveHours = hasMinutesOrSeconds ? 0 : (hoursOpt || 0);
   const effectiveDays = hasCustom ? 0 : (daysOpt ?? parseInt(process.env.MAX_BACKFILL_DAYS || '0', 10));
 
+  const afterStr = interaction.options.getString('after');
+  const beforeStr = interaction.options.getString('before');
+
+  let afterTimestamp = 0;
+  let beforeTimestamp = 0;
+
+  if (afterStr) {
+    const d = new Date(afterStr + 'T00:00:00.000Z');
+    if (isNaN(d.getTime())) {
+      await reportStatus('Invalid `after` date. Use YYYY-MM-DD format (e.g. 2026-03-01).');
+      return;
+    }
+    afterTimestamp = d.getTime() + 86400000;
+  }
+
+  if (beforeStr) {
+    const d = new Date(beforeStr + 'T00:00:00.000Z');
+    if (isNaN(d.getTime())) {
+      await reportStatus('Invalid `before` date. Use YYYY-MM-DD format (e.g. 2026-04-01).');
+      return;
+    }
+    beforeTimestamp = d.getTime();
+  }
+
+  if (afterTimestamp && beforeTimestamp && afterTimestamp >= beforeTimestamp) {
+    await reportStatus('`after` must be before `before`.');
+    return;
+  }
+
+  const useDateRange = afterTimestamp > 0 || beforeTimestamp > 0;
+
   const mediaConfig: MediaConfig = {
     images: typeChoice === 'all' || typeChoice.includes('images'),
     videos: typeChoice === 'all' || typeChoice.includes('videos'),
@@ -194,7 +233,9 @@ export async function execute(
     other: typeChoice === 'all',
   };
 
-  const scopeLabel = buildScopeLabel(effectiveDays, effectiveHours, effectiveMinutes, effectiveSeconds);
+  const scopeLabel = useDateRange
+    ? `${afterStr || 'beginning'} → ${beforeStr || 'now'}`
+    : buildScopeLabel(effectiveDays, effectiveHours, effectiveMinutes, effectiveSeconds);
   const concurrency = Math.min(Math.max(interaction.options.getInteger('concurrency') ?? 3, 1), 10);
 
   let totalMessages = 0;
@@ -202,6 +243,7 @@ export async function execute(
   let totalSize = 0;
   let lastOutputPath: string | null = null;
   let hadError = false;
+  const channelResults: { baseDir: string; megaBasePath: string }[] = [];
 
   resetGlobalCancel();
 
@@ -216,7 +258,7 @@ export async function execute(
   const processChannel = async (
     targetChannel: TextChannel | NewsChannel | ThreadChannel,
     ci: number
-  ): Promise<{ messages: number; media: number; size: number; outputPath: string } | null> => {
+  ): Promise<{ messages: number; media: number; size: number; outputPath: string; baseDir: string; megaBasePath: string } | null> => {
     const channelName = targetChannel.name || targetChannel.id;
     const guildId = targetChannel.guild?.id || 'unknown';
     const channelId = targetChannel.id;
@@ -239,46 +281,94 @@ export async function execute(
 
       db.markChannelIncomplete(guildId, channelId);
 
-      const now = Date.now();
-      const prevTs = channelState?.oldest_message_id
-        ? discordSnowflakeToTimestamp(channelState.oldest_message_id)
+      const hasTimeRange = effectiveDays > 0 || effectiveHours > 0 || effectiveMinutes > 0 || effectiveSeconds > 0;
+      const totalReqMs = hasTimeRange
+        ? (effectiveDays * 86400000) + (effectiveHours * 3600000) + (effectiveMinutes * 60000) + (effectiveSeconds * 1000)
         : 0;
 
-      let beforeId: string | undefined;
-      let afterId: string | undefined;
-      const totalPrevMs = now - prevTs;
-      const noTimeRange = effectiveDays === 0 && effectiveHours === 0 && effectiveMinutes === 0 && effectiveSeconds === 0;
-      if (noTimeRange && channelState?.newest_message_id) {
-        afterId = channelState.newest_message_id;
-      } else if (prevTs > 0 && totalPrevMs > 0 && !noTimeRange) {
-        const totalReqMs = (effectiveDays * 86400000) + (effectiveHours * 3600000) + (effectiveMinutes * 60000) + (effectiveSeconds * 1000);
-        if (totalReqMs > totalPrevMs) {
-          beforeId = channelState!.oldest_message_id ?? undefined;
+      let forwardAfterId: string | undefined;
+      let backwardBeforeId: string | undefined;
+      let doForward = false;
+      let doBackward = false;
+
+      if (useDateRange) {
+        const beforeSnowflake = beforeTimestamp ? timestampToSnowflake(beforeTimestamp) : null;
+
+        // Backward fetch from before-bound, stopping at after-bound (handled by fetchAllChannelMessages)
+        if (beforeTimestamp) {
+          backwardBeforeId = beforeSnowflake!;
+        }
+        // else (only after): backwardBeforeId stays undefined, starts from newest
+        doBackward = true;
+      } else {
+        let cutoffTs = 0;
+        let cutoffSnowflake = '';
+        if (hasTimeRange) {
+          cutoffTs = Date.now() - totalReqMs;
+          cutoffSnowflake = timestampToSnowflake(cutoffTs);
+        }
+
+        if (channelState?.newest_message_id) {
+          if (hasTimeRange && BigInt(cutoffSnowflake) > BigInt(channelState.newest_message_id)) {
+            forwardAfterId = cutoffSnowflake;
+          } else {
+            forwardAfterId = channelState.newest_message_id;
+          }
+          doForward = true;
+        }
+
+        if (hasTimeRange) {
+          if (!channelState?.oldest_message_id || BigInt(cutoffSnowflake) < BigInt(channelState.oldest_message_id)) {
+            backwardBeforeId = channelState?.oldest_message_id ?? undefined;
+            doBackward = true;
+          }
+        }
+
+        if (!channelState) {
+          doBackward = true;
         }
       }
-      await reportStatus(`${prefix}Scanning #${channelName} (${scopeLabel})...`);
 
-      const fetchResult = await fetchService.fetchAllChannelMessages(channelId, {
-        days: effectiveDays,
-        hours: effectiveHours,
-        minutes: effectiveMinutes,
-        seconds: effectiveSeconds,
-        beforeId,
-        afterId,
-        onStatus: (msg) => throttledStatus(`${prefix}${msg}`),
-      });
+      const allMessages: Message[] = [];
+      let totalMediaCount = 0;
 
-      if (fetchResult.messages.length === 0) {
+      if (doForward) {
+        await reportStatus(`${prefix}Scanning #${channelName} (${scopeLabel})...`);
+        const forwardResult = await fetchService.fetchNewMessages(
+          channelId, forwardAfterId!,
+          (msg) => throttledStatus(`${prefix}${msg}`),
+        );
+        allMessages.push(...forwardResult.messages);
+        totalMediaCount += forwardResult.mediaCount;
+      }
+
+      if (doBackward) {
+        await reportStatus(`${prefix}Scanning #${channelName} (${scopeLabel})...`);
+        const fetchResult = await fetchService.fetchAllChannelMessages(channelId, {
+          days: effectiveDays,
+          hours: effectiveHours,
+          minutes: effectiveMinutes,
+          seconds: effectiveSeconds,
+          beforeId: backwardBeforeId,
+          afterTimestamp: afterTimestamp || undefined,
+          beforeTimestamp: beforeTimestamp || undefined,
+          onStatus: (msg) => throttledStatus(`${prefix}${msg}`),
+        });
+        allMessages.push(...fetchResult.messages);
+        totalMediaCount += fetchResult.mediaCount;
+      }
+
+      if (allMessages.length === 0) {
         await reportStatus(`${prefix}#${channelName}: No new messages found.`);
         return null;
       }
 
-      await reportStatus(`${prefix}#${channelName}: ${fetchResult.messages.length} messages with ${fetchResult.mediaCount} media files. Downloading...`);
+      await reportStatus(`${prefix}#${channelName}: ${allMessages.length} messages with ${totalMediaCount} media files. Downloading...`);
 
       const logger = new SessionLogger(guildName, channelName, 'download');
       try {
         const result = await downloadService.downloadAllMedia(
-          fetchResult.messages,
+          allMessages,
           guildName,
           channelName,
           mediaConfig,
@@ -288,24 +378,27 @@ export async function execute(
           parentChannelName,
           concurrency,
           logger,
+          targetChannels.length > 1,
         );
 
-        if (fetchResult.messages.length > 0) {
-          const oldestMsg = fetchResult.messages[fetchResult.messages.length - 1];
-          const newestMsg = fetchResult.messages[0];
-          if (beforeId) {
-            db.updateOldestMessageId(guildId, channelId, oldestMsg.id);
-          } else {
-            db.updateChannelState(guildId, channelId, oldestMsg.id, newestMsg.id);
+        if (allMessages.length > 0) {
+          let minId = allMessages[0].id;
+          let maxId = allMessages[0].id;
+          for (const msg of allMessages) {
+            if (BigInt(msg.id) < BigInt(minId)) minId = msg.id;
+            if (BigInt(msg.id) > BigInt(maxId)) maxId = msg.id;
           }
+          db.updateChannelState(guildId, channelId, minId, maxId);
         }
 
         logger.close(`#${channelName}: ${result.mediaCount} files, ${formatBytes(result.totalBytes)}`);
         return {
-          messages: fetchResult.messages.length,
+          messages: allMessages.length,
           media: result.mediaCount,
           size: result.totalBytes,
           outputPath: result.outputPath,
+          baseDir: result.outputPath,
+          megaBasePath: result.megaBasePath,
         };
       } catch (error) {
         logger.close(`Error: ${error instanceof Error ? error.message : String(error)}`);
@@ -331,6 +424,7 @@ export async function execute(
         totalMedia += r.value.media;
         totalSize += r.value.size;
         if (r.value.outputPath) lastOutputPath = r.value.outputPath;
+        channelResults.push({ baseDir: r.value.baseDir, megaBasePath: r.value.megaBasePath });
       } else if (r.status === 'rejected') {
         hadError = true;
       }
@@ -352,6 +446,30 @@ export async function execute(
     (lastOutputPath ? `- Output: \`${lastOutputPath}\`` : '') +
     (hadError ? '\n- Some channels had errors (see above)' : '')
   );
+
+  if (targetChannels.length > 1 && channelResults.length > 0 && downloadService.megaService?.isConnected()) {
+    const total = channelResults.length;
+    await reportStatus(`Downloads complete!\nUploading to MEGA... (0/${total})`);
+    let uploadOk = 0;
+    let uploadFail = 0;
+    for (let i = 0; i < total; i++) {
+      const ch = channelResults[i];
+      await reportStatus(`Uploading to MEGA... (${i + 1}/${total})`);
+      try {
+        await downloadService.megaService.uploadDirectoryAndClean(ch.baseDir, ch.megaBasePath);
+        uploadOk++;
+      } catch (err: unknown) {
+        uploadFail++;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`MEGA upload failed for ${ch.megaBasePath}: ${msg}`);
+      }
+    }
+    if (uploadFail === 0) {
+      await reportStatus(`Upload complete!\n${uploadOk} channel(s) uploaded to MEGA.`);
+    } else {
+      await reportStatus(`Upload completed with ${uploadFail} error(s). ${uploadOk} channel(s) uploaded.`);
+    }
+  }
 }
 
 function buildScopeLabel(days: number, hours: number, minutes: number, seconds: number): string {
@@ -364,4 +482,8 @@ function buildScopeLabel(days: number, hours: number, minutes: number, seconds: 
 
 function discordSnowflakeToTimestamp(snowflake: string): number {
   return Number((BigInt(snowflake) >> 22n) + 1420070400000n);
+}
+
+function timestampToSnowflake(ts: number): string {
+  return ((BigInt(ts) - 1420070400000n) << 22n).toString();
 }

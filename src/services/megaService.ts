@@ -35,6 +35,9 @@ function delay(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
 }
 
+const UPLOAD_TIMEOUT = parseInt(process.env.MEGA_UPLOAD_TIMEOUT || '300000', 10);
+const UPLOAD_CONCURRENCY = parseInt(process.env.MEGA_UPLOAD_CONCURRENCY || '3', 10);
+
 export class MegaService {
   private storage: Storage | null = null;
   private rootFolder: string;
@@ -42,6 +45,9 @@ export class MegaService {
   private email: string = '';
   private password: string = '';
   private maxRetries: number;
+  private locks: Map<string, Promise<void>> = new Map();
+  private connectCallbacks: (() => void)[] = [];
+  private connected = false;
 
   constructor() {
     this.rootFolder = process.env.MEGA_ROOT || 'MediaDownloader';
@@ -49,8 +55,40 @@ export class MegaService {
     this.dirCache = new Map();
   }
 
+  private async withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    while (this.locks.has(key)) {
+      await this.locks.get(key);
+    }
+    let resolve: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    this.locks.set(key, promise);
+    try {
+      return await fn();
+    } finally {
+      this.locks.delete(key);
+      resolve!();
+    }
+  }
+
   isConnected(): boolean {
-    return this.storage !== null;
+    return this.connected;
+  }
+
+  onConnect(cb: () => void): void {
+    if (this.connected) {
+      cb();
+    } else {
+      this.connectCallbacks.push(cb);
+    }
+  }
+
+  private fireConnectCallbacks(): void {
+    this.connected = true;
+    const cbs = this.connectCallbacks.slice();
+    this.connectCallbacks = [];
+    for (const cb of cbs) {
+      try { cb(); } catch (err) { console.error('[MEGA] onConnect callback error:', err); }
+    }
   }
 
   async connect(): Promise<void> {
@@ -65,6 +103,7 @@ export class MegaService {
     try {
       this.storage = await new Storage({ email, password, keepalive: false }).ready;
       console.log('[MEGA] Connected');
+      this.fireConnectCallbacks();
     } catch (err) {
       console.error('[MEGA] Connection failed:', err);
     }
@@ -77,6 +116,7 @@ export class MegaService {
     try {
       this.storage = await new Storage({ email: this.email, password: this.password, keepalive: false }).ready;
       console.log('[MEGA] Reconnected');
+      this.fireConnectCallbacks();
     } catch (err) {
       console.error('[MEGA] Reconnect failed:', err);
     }
@@ -113,7 +153,10 @@ export class MegaService {
       readable.push(null);
       const result = remoteFolder.upload({ name: fileName, size: buffer.length }, readable);
       const errPromise = new Promise<never>((_, reject) => result.on('error', reject));
-      await Promise.race([result.complete, errPromise]);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Upload timed out')), UPLOAD_TIMEOUT)
+      );
+      await Promise.race([result.complete, errPromise, timeoutPromise]);
     }, `upload ${fileName}`);
   }
 
@@ -121,19 +164,12 @@ export class MegaService {
     if (!this.storage) return;
     if (!fs.existsSync(localPath)) return;
 
-    try {
-      const remoteBase = await this.mkdirRecursive(this.storage.root, this.rootFolder);
+    await this.withLock(`upload:${remoteFolder}`, async () => {
+      const remoteBase = await this.mkdirRecursive(this.storage!.root, this.rootFolder);
       const remoteDir = await this.mkdirRecursive(remoteBase, remoteFolder);
-      await this.uploadRecursive(localPath, remoteDir);
+      await this.uploadRecursive(localPath, remoteDir, deleteAfter);
       console.log(`[MEGA] Upload complete: ${remoteFolder}`);
-
-      if (deleteAfter) {
-        fs.rmSync(localPath, { recursive: true, force: true });
-        console.log(`[MEGA] Deleted local: ${localPath}`);
-      }
-    } catch (err) {
-      console.error(`[MEGA] Upload failed for ${remoteFolder}:`, err);
-    }
+    });
   }
 
   async getRemoteDir(remoteDir: string, forceReload = false): Promise<any> {
@@ -169,8 +205,18 @@ export class MegaService {
       const stream = fs.createReadStream(localPath);
       const result = remoteFolder!.upload({ name: fileName, size: stat.size }, stream);
       const errPromise = new Promise<never>((_, reject) => result.on('error', reject));
-      await Promise.race([result.complete, errPromise]);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Upload timed out')), UPLOAD_TIMEOUT)
+      );
+      await Promise.race([result.complete, errPromise, timeoutPromise]);
     }, `upload ${fileName}`);
+  }
+
+  async uploadDirectoryAndClean(localPath: string, remoteFolder: string): Promise<void> {
+    if (!this.storage) return;
+    if (!fs.existsSync(localPath)) return;
+
+    await this.uploadDirectory(localPath, remoteFolder, true);
   }
 
   async fileExists(remoteFilePath: string, localSize: number): Promise<boolean> {
@@ -203,43 +249,80 @@ export class MegaService {
     }
   }
 
-  private async uploadRecursive(localDir: string, remoteDir: any): Promise<void> {
+  private async uploadRecursive(localDir: string, remoteDir: any, deleteAfter = false): Promise<void> {
     const entries = fs.readdirSync(localDir, { withFileTypes: true });
+
     for (const entry of entries) {
-      const localPath = path.join(localDir, entry.name);
       if (entry.isDirectory()) {
+        const localPath = path.join(localDir, entry.name);
         const subDir = await this.mkdirRecursive(remoteDir, entry.name);
-        await this.uploadRecursive(localPath, subDir);
-      } else if (entry.isFile()) {
-        const stat = fs.statSync(localPath);
+        await this.uploadRecursive(localPath, subDir, deleteAfter);
+      }
+    }
+
+    const files = entries.filter(e => e.isFile());
+    for (let i = 0; i < files.length; i += UPLOAD_CONCURRENCY) {
+      const batch = files.slice(i, i + UPLOAD_CONCURRENCY);
+      await Promise.all(batch.map(async (entry) => {
+        const localPath = path.join(localDir, entry.name);
+        let stat;
+        try {
+          stat = fs.statSync(localPath);
+        } catch (err: any) {
+          if (err?.code === 'ENOENT') {
+            console.log(`[MEGA] Skipped ${entry.name} (disappeared before upload)`);
+            return;
+          }
+          throw err;
+        }
         const existing = remoteDir.children?.find((c: any) => c.name === entry.name && !c.directory && c.size === stat.size);
         if (existing) {
           console.log(`[MEGA] Skipped ${entry.name} (already exists in this dir)`);
-          continue;
+          if (deleteAfter) {
+            try { fs.unlinkSync(localPath); } catch {}
+          }
+          return;
         }
         await this.callWithRetry(async () => {
-          const stream = fs.createReadStream(localPath);
+          let stream;
+          try {
+            stream = fs.createReadStream(localPath);
+          } catch (err: any) {
+            if (err?.code === 'ENOENT') {
+              console.log(`[MEGA] Skipped ${entry.name} (disappeared before upload stream)`);
+              return;
+            }
+            throw err;
+          }
           const result = remoteDir.upload({ name: entry.name, size: stat.size }, stream);
           const errPromise = new Promise<never>((_, reject) => result.on('error', reject));
-          await Promise.race([result.complete, errPromise]);
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('Upload timed out')), UPLOAD_TIMEOUT)
+          );
+          await Promise.race([result.complete, errPromise, timeoutPromise]);
         }, `upload ${entry.name}`);
-      }
+        if (deleteAfter) {
+          try { fs.unlinkSync(localPath); } catch {}
+        }
+      }));
     }
   }
 
   private async mkdirRecursive(parent: any, folderPath: string): Promise<any> {
-    const parts = folderPath.split(/[/\\]+/).filter(Boolean);
-    let current = parent;
-    for (const part of parts) {
-      const existing = current.children?.find((c: any) => c.name === part && c.directory);
-      if (existing) {
-        current = existing;
-      } else {
-        const created = await current.mkdir({ name: part });
-        if (current.children) current.children.push(created);
-        current = created;
+    return this.withLock(`${parent.nodeId}/${folderPath}`, async () => {
+      const parts = folderPath.split(/[/\\]+/).filter(Boolean);
+      let current = parent;
+      for (const part of parts) {
+        const existing = current.children?.find((c: any) => c.name === part && c.directory);
+        if (existing) {
+          current = existing;
+        } else {
+          const created = await current.mkdir({ name: part });
+          if (current.children) current.children.push(created);
+          current = created;
+        }
       }
-    }
-    return current;
+      return current;
+    });
   }
 }

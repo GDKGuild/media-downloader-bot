@@ -44,24 +44,25 @@ async function main() {
     }
   }
 
-  const dbRows = db.prepare('SELECT hash, filename, guild_id, channel_id FROM media_hashes').all() as {
+  const dbRows = db.prepare('SELECT hash, filename, guild_id, channel_id, type FROM file_hashes').all() as {
     hash: string;
     filename: string;
     guild_id: string | null;
     channel_id: string | null;
+    type: string;
   }[];
 
   let deleted = 0;
-  const delStmt = db.prepare('DELETE FROM media_hashes WHERE hash = ?');
-  const delBatch = db.transaction((hashes: string[]) => {
-    for (const h of hashes) delStmt.run(h);
+  const delStmt = db.prepare('DELETE FROM file_hashes WHERE hash = ? AND guild_id = ? AND channel_id = ? AND type = ?');
+  const delBatch = db.transaction((rows: { hash: string; guild_id: string | null; channel_id: string | null; type: string }[]) => {
+    for (const r of rows) delStmt.run(r.hash, r.guild_id, r.channel_id, r.type);
   });
 
-  const toDelete: string[] = [];
+  const toDelete: typeof dbRows = [];
   for (const row of dbRows) {
     if (!diskHashes.has(row.hash)) {
-      toDelete.push(row.hash);
-      console.log(`  Orphan: ${row.filename} (guild=${row.guild_id}, channel=${row.channel_id})`);
+      toDelete.push(row);
+      console.log(`  Orphan: ${row.filename} (guild=${row.guild_id}, channel=${row.channel_id}, type=${row.type})`);
     }
   }
 

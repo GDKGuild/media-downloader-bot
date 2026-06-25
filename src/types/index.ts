@@ -19,5 +19,7 @@ export interface FetchOptions {
   seconds?: number;
   beforeId?: string;
   afterId?: string;
+  afterTimestamp?: number;
+  beforeTimestamp?: number;
   onStatus?: (message: string) => void;
 }

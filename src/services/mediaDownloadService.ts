@@ -2,14 +2,15 @@ import path from 'path';
 import crypto from 'crypto';
 import * as fs from 'fs';
 import axios from 'axios';
-import { Message } from 'discord.js';
+import { Message, Client } from 'discord.js';
 import { FileService, sanitize } from './fileService';
-import { DatabaseService } from './databaseService';
-import { formatBytes, extractEmojiIds, extractMediaFromMessage, MediaEntry, MediaCategory, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS } from '../utils/mediaUtils';
+import { DatabaseService, FileType } from './databaseService';
+import { formatBytes, extractEmojiIds, extractMediaFromMessage, MediaEntry, MediaCategory, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isDiscordCdnUrl } from '../utils/mediaUtils';
 import { MediaConfig, DownloadProgress } from '../types';
 import { isCancelled } from './cancelManager';
 import { SessionLogger } from '../utils/sessionLogger';
 import { MegaService } from './megaService';
+import { DeferredDownloadQueue, DeferredEntry } from './deferredDownloadQueue';
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -28,6 +29,53 @@ const MIME_EXT: Record<string, string> = {
 
 function mimeToExt(mime: string | null): string {
   return (mime && MIME_EXT[mime]) || 'dat';
+}
+
+function detectExtFromBuffer(buffer: Buffer): string | null {
+  const len = buffer.length;
+  if (len < 8) {
+    if (len >= 4 && buffer[0] === 0 && buffer[1] === 0 && (buffer[2] === 1 || buffer[2] === 2) && buffer[3] === 0) return 'ico';
+    if (len >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpg';
+    if (len >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4D) return 'bmp';
+    return null;
+  }
+
+  const hex = buffer.toString('hex', 0, 16);
+
+  if (hex.startsWith('89504e470d0a1a0a')) return 'png';
+  if (hex.startsWith('47494638373661') || hex.startsWith('47494638393961')) return 'gif';
+  if (hex.startsWith('52494646') && hex.length >= 24 && hex.slice(16, 24) === '57454250') return 'webp';
+  if (hex.startsWith('25504446')) return 'pdf';
+  if (hex.startsWith('1a45dfa3')) {
+    const body = buffer.toString('ascii', 0, Math.min(len, 200));
+    return body.includes('matroska') ? 'mkv' : 'webm';
+  }
+  if (hex.startsWith('464c56')) return 'flv';
+  if (hex.startsWith('494433')) return 'mp3';
+  if (hex.startsWith('4f676753')) return 'ogg';
+  if (hex.startsWith('664c6143')) return 'flac';
+
+  if (hex.startsWith('52494646')) {
+    const riffType = buffer.toString('ascii', 8, 12);
+    if (riffType === 'AVI ') return 'avi';
+    if (riffType === 'WAVE') return 'wav';
+  }
+
+  if (buffer.toString('ascii', 4, 8) === 'ftyp') {
+    const brand = buffer.toString('ascii', 8, 12);
+    if (brand === 'qt  ') return 'mov';
+    if (['M4A ', 'M4B ', 'M4P '].includes(brand)) return 'm4a';
+    return 'mp4';
+  }
+
+  const head = buffer.toString('utf8', 0, Math.min(len, 20)).trimStart();
+  if (head.startsWith('<svg') || head.startsWith('<?xml') || head.startsWith('<!DOCTYPE')) {
+    if (buffer.toString('utf8', 0, Math.min(len, 200)).toLowerCase().includes('<svg')) return 'svg';
+  }
+
+  if (len >= 2 && buffer[0] === 0xFF && (buffer[1] & 0xE0) === 0xE0) return 'mp3';
+
+  return null;
 }
 
 function filenameFromUrl(url: string): string {
@@ -113,6 +161,7 @@ function setFileTimestamps(filePath: string, timestampMs: number): void {
   }
 }
 
+
 export class MediaDownloadService {
   private fileService: FileService;
   private db: DatabaseService;
@@ -123,10 +172,13 @@ export class MediaDownloadService {
   private retries: number;
   private loggedKeys: Set<string>;
 
-  private megaService?: MegaService;
+  public megaService?: MegaService;
+  public deferredQueue?: DeferredDownloadQueue;
+  private processingQueue = false;
 
-  constructor(fileService: FileService, db: DatabaseService, onProgress: (progress: DownloadProgress) => void, downloadDir?: string, retries?: number, megaService?: MegaService) {
+  constructor(fileService: FileService, db: DatabaseService, onProgress: (progress: DownloadProgress) => void, downloadDir?: string, retries?: number, megaService?: MegaService, deferredQueue?: DeferredDownloadQueue) {
     this.megaService = megaService;
+    this.deferredQueue = deferredQueue;
     this.fileService = fileService;
     this.db = db;
     this.onProgress = onProgress;
@@ -169,8 +221,9 @@ export class MediaDownloadService {
     parentChannelName?: string,
     concurrency = 3,
     logger?: SessionLogger,
-  ): Promise<{ mediaCount: number; outputPath: string; totalBytes: number }> {
-    const remotePath = parentChannelName
+    skipUpload = false,
+  ): Promise<{ mediaCount: number; outputPath: string; totalBytes: number; megaBasePath: string }> {
+    const megaBasePath = parentChannelName
       ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName || '')}/${sanitize(channelName)}`
       : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
 
@@ -179,16 +232,21 @@ export class MediaDownloadService {
 
     const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
 
-    const avatarResult = await this.downloadAvatars(messages, baseDir, concurrency);
+    const avatarResult = await this.downloadAvatars(messages, baseDir, megaBasePath, concurrency, guildId, channelId, logger);
     logger?.log(`Avatars: ${avatarResult.count} downloaded`);
-    if (channelId && isCancelled(channelId)) return { mediaCount: 0, outputPath: baseDir, totalBytes: 0 };
+    if (channelId && isCancelled(channelId)) return { mediaCount: 0, outputPath: baseDir, totalBytes: 0, megaBasePath };
 
     if (onStatus) onStatus('Downloading media files...');
-    const mediaResult = await this.downloadAttachments(messages, baseDir, mediaConfig, guildId, channelId, channelName, concurrency, logger);
-    if (channelId && isCancelled(channelId)) return { mediaCount: mediaResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes };
+    const mediaResult = await this.downloadAttachments(messages, baseDir, megaBasePath, mediaConfig, guildId, channelId, channelName, concurrency, logger);
+    if (channelId && isCancelled(channelId)) return { mediaCount: mediaResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes, megaBasePath };
 
-    const emojiResult = await this.downloadEmojis(messages, baseDir, concurrency);
+    const emojiResult = await this.downloadEmojis(messages, baseDir, megaBasePath, concurrency, guildId, channelId, logger);
     logger?.log(`Emojis: ${emojiResult.count} downloaded`);
+
+    if (!skipUpload && this.megaService?.isConnected()) {
+      logger?.log(`Uploading to MEGA...`);
+      await this.megaService.uploadDirectoryAndClean(baseDir, megaBasePath);
+    }
 
     const stats = this.fileService.getDownloadStats(baseDir);
     const lines = [
@@ -206,9 +264,7 @@ export class MediaDownloadService {
     this.fileService.writeSummary(baseDir, lines.join('\n'));
     logger?.log(`Session summary: ${mediaResult.count} media, ${avatarResult.count} avatars, ${emojiResult.count} emojis (${formatBytes(stats.totalSize)})`);
 
-    this.megaService?.uploadDirectory(baseDir, remotePath).catch(() => {});
-
-    return { mediaCount: mediaResult.count + avatarResult.count + emojiResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes + avatarResult.bytes + emojiResult.bytes };
+    return { mediaCount: mediaResult.count + avatarResult.count + emojiResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes + avatarResult.bytes + emojiResult.bytes, megaBasePath };
   }
 
   async downloadMediaOnly(
@@ -220,13 +276,14 @@ export class MediaDownloadService {
     channelId?: string,
     parentChannelName?: string,
     concurrency = 3,
+    skipUpload = false,
   ): Promise<{ mediaCount: number; outputPath: string; totalBytes: number }> {
-    const remotePath = parentChannelName
+    const megaBasePath = parentChannelName
       ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName || '')}/${sanitize(channelName)}`
       : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
 
     const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
-    const mediaResult = await this.downloadAttachments(messages, baseDir, mediaConfig, guildId, channelId, channelName, concurrency);
+    const mediaResult = await this.downloadAttachments(messages, baseDir, megaBasePath, mediaConfig, guildId, channelId, channelName, concurrency);
 
     const stats = this.fileService.getDownloadStats(baseDir);
     const lines = [
@@ -241,8 +298,6 @@ export class MediaDownloadService {
     ];
     this.fileService.writeSummary(baseDir, lines.join('\n'));
 
-    this.megaService?.uploadDirectory(baseDir, remotePath).catch(() => {});
-
     return { mediaCount: mediaResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes };
   }
 
@@ -254,20 +309,37 @@ export class MediaDownloadService {
     parentChannelName?: string,
     logger?: SessionLogger,
   ): Promise<number> {
-    const remotePath = parentChannelName
-      ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName || '')}/${sanitize(channelName)}`
-      : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
-
     logger?.log(`Auto-download triggered: ${message.author.tag} sent a message in #${channelName}`);
+
+    // If MEGA exists but isn't connected and we have a deferred queue, enqueue for later
+    // Skip re-enqueue if we're currently draining the queue (e.g. fallback flush)
+    if (!this.processingQueue && this.megaService && !this.megaService.isConnected() && this.deferredQueue) {
+      this.deferredQueue.enqueue({
+        guildId: message.guild?.id || '',
+        channelId: message.channel.id,
+        messageId: message.id,
+        guildName,
+        channelName,
+        parentChannelName,
+        mediaConfig: mediaConfig || { images: true, videos: true, audio: true, other: true },
+        timestamp: Date.now(),
+      });
+      logger?.log(`Deferred auto-download for #${channelName} (MEGA not connected, ${this.deferredQueue.count()} queued)`);
+      console.log(`[Auto] Deferred download for ${channelName} by ${message.author.tag} (MEGA not connected)`);
+      return 0;
+    }
 
     const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
     const result = await this.downloadMessageMedia(message, baseDir, 0, mediaConfig, logger);
-    logger?.log(`Auto-downloaded ${result.count} file(s) from ${message.author.tag}`);
 
-    if (result.count > 0) {
-      this.megaService?.uploadDirectory(baseDir, remotePath).catch(() => {});
+    if (result.count > 0 && this.megaService?.isConnected()) {
+      const megaBasePath = parentChannelName
+        ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName)}/${sanitize(channelName)}`
+        : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
+      this.megaService.uploadDirectory(baseDir, megaBasePath, true).catch(() => {});
     }
 
+    logger?.log(`Auto-downloaded ${result.count} file(s) from ${message.author.tag}`);
     return result.count;
   }
 
@@ -277,6 +349,60 @@ export class MediaDownloadService {
 
   clearSeenHashes(): void {
     this.seenHashes.clear();
+  }
+
+  async processDeferredQueue(client: Client): Promise<void> {
+    if (this.processingQueue || !this.deferredQueue) return;
+    this.processingQueue = true;
+    const entries = this.deferredQueue.list();
+    if (entries.length === 0) {
+      this.processingQueue = false;
+      return;
+    }
+    console.log(`[Queue] Processing ${entries.length} deferred auto-download(s)...`);
+    for (const entry of entries) {
+      try {
+        const channel = await client.channels.fetch(entry.channelId).catch(() => null);
+        if (!channel) {
+          console.log(`[Queue] Channel ${entry.channelId} not found, removing entry`);
+          this.deferredQueue.remove(entry);
+          continue;
+        }
+        const channelAny = channel as any;
+        if (!channelAny.messages?.fetch) {
+          console.log(`[Queue] Cannot fetch messages in channel ${entry.channelId}, removing entry`);
+          this.deferredQueue.remove(entry);
+          continue;
+        }
+        const message = await channelAny.messages.fetch(entry.messageId).catch(() => null);
+        if (!message) {
+          console.log(`[Queue] Message ${entry.messageId} not found (deleted?), removing entry`);
+          this.deferredQueue.remove(entry);
+          continue;
+        }
+        const count = await this.downloadNewMessageMedia(
+          message as Message,
+          entry.guildName,
+          entry.channelName,
+          entry.mediaConfig,
+          entry.parentChannelName,
+        );
+        console.log(`[Queue] Processed deferred message ${entry.messageId}: ${count} file(s)`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[Queue] Error processing deferred message ${entry.messageId}: ${msg}`);
+      }
+      this.deferredQueue.remove(entry);
+      // Rate-limit: 1s between fetches to avoid hitting Discord rate limits
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    this.processingQueue = false;
+    const remaining = this.deferredQueue.count();
+    if (remaining > 0) {
+      console.log(`[Queue] ${remaining} entry(s) still pending after processing cycle`);
+    } else {
+      console.log(`[Queue] All deferred auto-downloads processed`);
+    }
   }
 
   private logDownloadEvent(entry: MediaEntry, reason: string, channel?: string): void {
@@ -308,7 +434,11 @@ export class MediaDownloadService {
   private async downloadAvatars(
     messages: Message[],
     baseDir: string,
+    megaBasePath: string,
     concurrency = 3,
+    guildId?: string,
+    channelId?: string,
+    logger?: SessionLogger,
   ): Promise<{ count: number; bytes: number }> {
     const avatarSet = new Set<string>();
 
@@ -339,14 +469,19 @@ export class MediaDownloadService {
 
           const avatarDir = this.fileService.getAvatarDir(baseDir);
           const userDir = path.join(avatarDir, userId);
-          await this.fileService.downloadWithMime(url, null, userDir, avatarHash);
-          return 0;
+
+          const result = await this.tryDownload(
+            url, null, userDir, avatarHash, 'images', 'webp', guildId, channelId, undefined, logger,
+            'avatar',
+          );
+          return result;
         })
       );
 
       for (const r of results) {
-        if (r.status === 'fulfilled') {
+        if (r.status === 'fulfilled' && r.value.status === 'downloaded') {
           downloaded++;
+          totalBytes += r.value.bytes;
         }
         this.onProgress({
           stage: 'avatars',
@@ -391,7 +526,6 @@ export class MediaDownloadService {
           }
 
           const extFallback = IMAGE_EXTS.includes(urlExt) ? 'jpg' : 'mp4';
-          const dummyName = category === 'images' ? 'image' : category === 'videos' ? 'video' : 'audio';
 
           extra.push({
             url: embed.url,
@@ -410,7 +544,6 @@ export class MediaDownloadService {
         for (const s of scraped) {
           const category: MediaCategory = s.type === 'video' ? 'videos' : 'images';
           const ext = extFromUrl(s.url, s.type === 'video' ? 'mp4' : 'jpg');
-          const dummyName = s.type === 'video' ? 'video' : 'image';
 
           if (mediaConfig) {
             if (s.type === 'video' && !mediaConfig.videos) continue;
@@ -438,6 +571,7 @@ export class MediaDownloadService {
     entries: MediaEntry[],
     stage: string,
     baseDir: string,
+    megaBasePath: string,
     guildId?: string,
     channelId?: string,
     channelName?: string,
@@ -488,7 +622,8 @@ export class MediaDownloadService {
             channelId,
             entry.index,
             entry.timestamp,
-            logger
+            logger,
+            'media',
           );
         })
       );
@@ -524,6 +659,7 @@ export class MediaDownloadService {
   private async downloadAttachments(
     messages: Message[],
     baseDir: string,
+    megaBasePath: string,
     mediaConfig?: MediaConfig,
     guildId?: string,
     channelId?: string,
@@ -563,14 +699,15 @@ export class MediaDownloadService {
     const attachmentEntries = entries.filter(e => e.type === 'attachment');
     const embedEntries = entries.filter(e => e.type !== 'attachment');
 
-    const attResult = await this.downloadEntryList(attachmentEntries, 'attachments', baseDir, guildId, channelId, channelName, concurrency, logger);
-    const embedResult = await this.downloadEntryList(embedEntries, 'embeds', baseDir, guildId, channelId, channelName, concurrency, logger);
+    const attResult = await this.downloadEntryList(attachmentEntries, 'attachments', baseDir, megaBasePath, guildId, channelId, channelName, concurrency, logger);
+    const embedResult = await this.downloadEntryList(embedEntries, 'embeds', baseDir, megaBasePath, guildId, channelId, channelName, concurrency, logger);
 
     return { count: attResult.count + embedResult.count, bytes: attResult.bytes + embedResult.bytes };
   }
 
   private async tryDownload(
     url: string,
+    proxyUrl: string | null,
     outputDir: string,
     filename: string,
     category: string,
@@ -579,14 +716,17 @@ export class MediaDownloadService {
     channelId?: string,
     timestamp?: number,
     logger?: SessionLogger,
+    type: FileType = 'media',
   ): Promise<{ status: 'downloaded' | 'skipped' | 'failed'; bytes: number }> {
+    const actualUrl = proxyUrl || url;
+
     for (let attempt = 1; attempt <= this.retries; attempt++) {
-      logger?.log(`Download attempt ${attempt}/${this.retries}: ${filename} <- ${url}`);
+      logger?.log(`Download attempt ${attempt}/${this.retries}: download <- ${actualUrl}`);
       try {
         const response = await Promise.race([
           axios({
             method: 'GET',
-            url,
+            url: actualUrl,
             responseType: 'arraybuffer',
             timeout: 30000,
             headers: { 'User-Agent': BROWSER_UA, 'Accept': '*/*', 'Referer': 'https://discord.com/' },
@@ -600,33 +740,45 @@ export class MediaDownloadService {
         const hash = crypto.createHash('sha256').update(buffer).digest('hex');
         const bytes = buffer.length;
 
-        if (this.seenHashes.has(hash)) { logger?.log(`Skipped ${filename} (in-memory duplicate)`); return { status: 'skipped', bytes: 0 }; }
-        if (this.db.hasHash(hash)) { logger?.log(`Skipped ${filename} (already in DB)`); return { status: 'skipped', bytes: 0 }; }
+        const memKey = `${hash}|${guildId || ''}|${channelId || ''}|${type}`;
+        if (this.seenHashes.has(memKey)) {
+          logger?.log(`Skipped (in-memory duplicate)`);
+          return { status: 'skipped', bytes: 0 };
+        }
 
-        const finalExt = mimeToExt(
+        if (guildId && channelId && this.db.hasFileHash(hash, guildId, channelId, type)) {
+          // File already in DB — batch MEGA upload at end will handle any orphans
+          logger?.log(`Skipped (already in DB for this channel)`);
+          return { status: 'skipped', bytes: 0 };
+        }
+
+        const detectedExt = detectExtFromBuffer(buffer);
+        const finalExt = detectedExt || (EMBED_EXTS.includes(ext) ? ext : null) || mimeToExt(
           typeof response.headers['content-type'] === 'string' ? response.headers['content-type'] : null
-        ) || ext;
+        ) || ext || 'dat';
         const finalName = `${filename}.${finalExt}`;
         let finalPath = path.join(outputDir, finalName);
 
         if (fs.existsSync(finalPath)) {
           const existingBuf = fs.readFileSync(finalPath);
           const existingHash = crypto.createHash('sha256').update(existingBuf).digest('hex');
-          if (existingHash === hash) { logger?.log(`Skipped ${filename} (file content duplicate)`); return { status: 'skipped', bytes: 0 }; }
+          if (existingHash === hash) { logger?.log(`Skipped (file content duplicate)`); return { status: 'skipped', bytes: 0 }; }
           const prefix = hash.slice(0, 8);
           finalPath = path.join(outputDir, `${filename}_${prefix}.${finalExt}`);
         }
 
+        const storedName = path.basename(finalPath);
         this.fileService.ensureDir(outputDir);
         fs.writeFileSync(finalPath, buffer);
 
         if (timestamp) setFileTimestamps(finalPath, timestamp);
 
-        const storedName = path.basename(finalPath);
-        this.seenHashes.add(hash);
-        this.db.insertHash(hash, storedName, bytes, guildId || null, channelId || null, null);
+        // Commit hash to DB immediately after successful download (before batch MEGA upload)
+        this.seenHashes.add(memKey);
+        this.db.insertFileHash(hash, guildId || '', channelId || '', type, isDiscordCdnUrl(url) ? url : null, storedName, bytes, category === 'images' || category === 'videos' || category === 'audio' ? category : null);
 
         logger?.log(`Downloaded ${storedName} (${bytes} bytes)`);
+
         return { status: 'downloaded', bytes };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -639,7 +791,7 @@ export class MediaDownloadService {
         }
       }
     }
-    logger?.log(`Failed ${filename} after ${this.retries} attempts`);
+    logger?.log(`Failed after ${this.retries} attempts`);
     return { status: 'failed', bytes: 0 };
   }
 
@@ -655,17 +807,22 @@ export class MediaDownloadService {
     messageIndex?: number,
     timestamp?: number,
     logger?: SessionLogger,
+    type: FileType = 'media',
   ): Promise<{ status: 'downloaded' | 'skipped' | 'failed'; bytes: number }> {
-    const result = await this.tryDownload(proxyUrl || url, outputDir, filename, category, ext, guildId, channelId, timestamp, logger);
+    const result = await this.tryDownload(proxyUrl || url, null, outputDir, filename, category, ext, guildId, channelId, timestamp, logger, type);
     if (result.status !== 'failed' || !proxyUrl || url === proxyUrl) return result;
     logger?.log(`Proxy failed, falling back to direct URL`);
-    return this.tryDownload(url, outputDir, filename, category, ext, guildId, channelId, timestamp, logger);
+    return this.tryDownload(url, null, outputDir, filename, category, ext, guildId, channelId, timestamp, logger, type);
   }
 
   private async downloadEmojis(
     messages: Message[],
     baseDir: string,
+    megaBasePath: string,
     concurrency = 3,
+    guildId?: string,
+    channelId?: string,
+    logger?: SessionLogger,
   ): Promise<{ count: number; bytes: number }> {
     const emojiIds = new Set<string>();
 
@@ -698,14 +855,19 @@ export class MediaDownloadService {
           const url = `https://cdn.discordapp.com/emojis/${emojiId}.webp?animated=true`;
 
           const emojiDir = this.fileService.getEmojiDir(baseDir);
-          await this.fileService.downloadWithMime(url, null, emojiDir, emojiId);
-          return 0;
+
+          const result = await this.tryDownload(
+            url, null, emojiDir, emojiId, 'images', 'webp', guildId, channelId, undefined, logger,
+            'emoji',
+          );
+          return result;
         })
       );
 
       for (const r of results) {
-        if (r.status === 'fulfilled') {
+        if (r.status === 'fulfilled' && r.value.status === 'downloaded') {
           downloaded++;
+          totalBytes += r.value.bytes;
         }
         this.onProgress({
           stage: 'emojis',
@@ -741,8 +903,16 @@ export class MediaDownloadService {
     const attachmentEntries = entries.filter(e => e.type === 'attachment');
     const embedEntries = entries.filter(e => e.type !== 'attachment');
 
-    const attResult = await this.downloadEntryList(attachmentEntries, 'attachments', baseDir, message.guild?.id, message.channel.id, undefined, 3, logger);
-    const embedResult = await this.downloadEntryList(embedEntries, 'embeds', baseDir, message.guild?.id, message.channel.id, undefined, 3, logger);
+    // For auto-download, we don't have megaBasePath easily, so construct it
+    const guildId = message.guild?.id;
+    const channelId = message.channel.id;
+    const guildName = message.guild?.name || 'Unknown';
+    const channelName = (message.channel as any).name || channelId;
+
+    const megaBasePath = `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
+
+    const attResult = await this.downloadEntryList(attachmentEntries, 'attachments', baseDir, megaBasePath, guildId, channelId, undefined, 3, logger);
+    const embedResult = await this.downloadEntryList(embedEntries, 'embeds', baseDir, megaBasePath, guildId, channelId, undefined, 3, logger);
 
     return { count: attResult.count + embedResult.count, bytes: attResult.bytes + embedResult.bytes };
   }

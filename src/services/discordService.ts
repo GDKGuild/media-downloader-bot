@@ -36,7 +36,8 @@ export class DiscordFetchService {
       + ((options?.hours || 0) * 3600000)
       + ((options?.minutes || 0) * 60000)
       + ((options?.seconds || 0) * 1000);
-    const cutoffMs = totalMs > 0 ? Date.now() - totalMs : 0;
+    const lowerBound = options?.afterTimestamp || (totalMs > 0 ? Date.now() - totalMs : 0);
+    const upperBound = options?.beforeTimestamp || 0;
 
     for (;;) {
       if (isCancelled(channelId)) {
@@ -59,27 +60,38 @@ export class DiscordFetchService {
 
       const messageArray = Array.from(messages.values());
 
-      if (cutoffMs > 0 && messageArray[messageArray.length - 1].createdTimestamp < cutoffMs) {
-        const filtered = messageArray.filter(m => m.createdTimestamp >= cutoffMs);
+      // Upper bound: skip batches where even the oldest message is newer than beforeTimestamp
+      if (upperBound > 0 && messageArray[messageArray.length - 1].createdTimestamp > upperBound) {
+        lastId = messageArray[messageArray.length - 1].id;
+        await this.delay(1100);
+        continue;
+      }
+
+      // Filter out messages newer than beforeTimestamp
+      let batch = messageArray;
+      if (upperBound > 0) {
+        batch = messageArray.filter(m => m.createdTimestamp <= upperBound);
+      }
+
+      // Lower bound: stop when oldest message in batch is older than afterTimestamp
+      if (lowerBound > 0 && batch[batch.length - 1].createdTimestamp < lowerBound) {
+        const filtered = batch.filter(m => m.createdTimestamp >= lowerBound);
         if (filtered.length > 0) {
           allMessages.push(...filtered);
           mediaCount += countMedia(filtered);
-          const cutoffLabel = options?.hours
-            ? `${options.hours}-hour`
-            : `${options?.days}-day`;
           this.onProgress({
             stage: 'fetching',
             current: allMessages.length,
             total: 0,
-            message: `Reached ${cutoffLabel} cutoff, fetched ${allMessages.length} messages`,
+            message: `Reached cutoff, fetched ${allMessages.length} messages`,
           });
         }
         break;
       }
 
       // stop if we've reached already-scanned messages (afterId is the newest known)
-      if (afterId && BigInt(messageArray[messageArray.length - 1].id) <= BigInt(afterId)) {
-        const filtered = messageArray.filter(m => BigInt(m.id) > BigInt(afterId));
+      if (afterId && BigInt(batch[batch.length - 1].id) <= BigInt(afterId)) {
+        const filtered = batch.filter(m => BigInt(m.id) > BigInt(afterId));
         if (filtered.length > 0) {
           allMessages.push(...filtered);
           mediaCount += countMedia(filtered);
@@ -87,8 +99,8 @@ export class DiscordFetchService {
         break;
       }
 
-      allMessages.push(...messageArray);
-      mediaCount += countMedia(messageArray);
+      allMessages.push(...batch);
+      mediaCount += countMedia(batch);
 
       const statusMsg = `Fetched ${allMessages.length} messages, found ${mediaCount} media files`;
       this.onProgress({
@@ -99,7 +111,50 @@ export class DiscordFetchService {
       });
       if (options?.onStatus) options.onStatus(statusMsg);
 
-      lastId = messageArray[messageArray.length - 1].id;
+      lastId = batch[batch.length - 1].id;
+
+      await this.delay(1100);
+    }
+
+    return { messages: allMessages, mediaCount };
+  }
+
+  async fetchNewMessages(
+    channelId: string,
+    afterId: string,
+    onStatus?: (msg: string) => void,
+  ): Promise<FetchResult> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel) throw new Error(`Channel ${channelId} not found`);
+    if (!(channel instanceof TextChannel || channel instanceof DMChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel)) {
+      throw new Error(`Channel ${channelId} is not a text-based channel`);
+    }
+
+    const allMessages: Message[] = [];
+    let lastId = afterId;
+    let mediaCount = 0;
+
+    for (;;) {
+      if (isCancelled(channelId)) break;
+
+      const messages = await channel.messages.fetch({ after: lastId, limit: 100 });
+      const count = messages.size;
+      if (count === 0) break;
+
+      const messageArray = Array.from(messages.values());
+      allMessages.push(...messageArray);
+      mediaCount += countMedia(messageArray);
+
+      const statusMsg = `Fetched ${allMessages.length} new messages, found ${mediaCount} media files`;
+      this.onProgress({
+        stage: 'fetching',
+        current: allMessages.length,
+        total: 0,
+        message: statusMsg,
+      });
+      if (onStatus) onStatus(statusMsg);
+
+      lastId = messageArray[0].id;
 
       await this.delay(1100);
     }

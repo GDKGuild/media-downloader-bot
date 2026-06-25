@@ -185,6 +185,15 @@ export function extractMediaFromMessage(msg: Message, index: number, mediaConfig
   return entries;
 }
 
+export function isDiscordCdnUrl(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'cdn.discordapp.com' || host === 'media.discordapp.net';
+  } catch {
+    return false;
+  }
+}
+
 export function countMedia(messages: Message[], mediaConfig?: MediaConfig): number {
   let count = 0;
   messages.forEach((msg, i) => {

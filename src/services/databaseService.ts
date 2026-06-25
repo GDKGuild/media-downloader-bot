@@ -8,6 +8,20 @@ export interface ChannelState {
   completed: boolean;
 }
 
+export type FileType = 'media' | 'avatar' | 'emoji';
+
+export interface FileHashRow {
+  hash: string;
+  guild_id: string;
+  channel_id: string;
+  type: FileType;
+  url: string | null;
+  filename: string;
+  file_size: number;
+  category: string | null;
+  created_at: string;
+}
+
 export class DatabaseService {
   private db: Database.Database;
 
@@ -21,15 +35,24 @@ export class DatabaseService {
 
   private init(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS media_hashes (
-        hash TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS file_hashes (
+        hash TEXT NOT NULL,
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('media', 'avatar', 'emoji')),
+        url TEXT,
         filename TEXT NOT NULL,
         file_size INTEGER DEFAULT 0,
-        guild_id TEXT,
-        channel_id TEXT,
-        message_id TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        category TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (hash, guild_id, channel_id, type)
       )
+    `);
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_file_hashes_url
+        ON file_hashes(url, guild_id, channel_id, type)
+        WHERE url IS NOT NULL
     `);
 
     this.db.exec(`
@@ -39,24 +62,44 @@ export class DatabaseService {
         oldest_message_id TEXT,
         newest_message_id TEXT,
         last_downloaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed INTEGER DEFAULT 1,
         PRIMARY KEY (guild_id, channel_id)
       )
     `);
-
-    // migration for existing DBs that lack newest_message_id
-    try { this.db.exec(`ALTER TABLE channel_state ADD COLUMN newest_message_id TEXT`); } catch {}
-    // migration: track whether the last download session completed
-    try { this.db.exec(`ALTER TABLE channel_state ADD COLUMN completed INTEGER DEFAULT 1`); } catch {}
   }
 
-  hasHash(hash: string): boolean {
-    return !!this.db.prepare('SELECT 1 FROM media_hashes WHERE hash = ?').get(hash);
+  hasFileHash(hash: string, guildId: string, channelId: string, type: FileType): boolean {
+    return !!this.db.prepare(
+      'SELECT 1 FROM file_hashes WHERE hash = ? AND guild_id = ? AND channel_id = ? AND type = ?'
+    ).get(hash, guildId, channelId, type);
   }
 
-  insertHash(hash: string, filename: string, fileSize: number, guildId: string | null, channelId: string | null, messageId: string | null): void {
+  hasFileUrl(url: string, guildId: string, channelId: string, type: FileType): boolean {
+    return !!this.db.prepare(
+      'SELECT 1 FROM file_hashes WHERE url = ? AND guild_id = ? AND channel_id = ? AND type = ?'
+    ).get(url, guildId, channelId, type);
+  }
+
+  getFileHash(hash: string, guildId: string, channelId: string, type: FileType): FileHashRow | null {
+    const row = this.db.prepare(
+      'SELECT hash, guild_id, channel_id, type, url, filename, file_size, category, created_at FROM file_hashes WHERE hash = ? AND guild_id = ? AND channel_id = ? AND type = ?'
+    ).get(hash, guildId, channelId, type) as FileHashRow | undefined;
+    return row || null;
+  }
+
+  insertFileHash(
+    hash: string,
+    guildId: string,
+    channelId: string,
+    type: FileType,
+    url: string | null,
+    filename: string,
+    fileSize: number,
+    category: string | null,
+  ): void {
     this.db.prepare(
-      'INSERT OR IGNORE INTO media_hashes (hash, filename, file_size, guild_id, channel_id, message_id) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(hash, filename, fileSize, guildId, channelId, messageId);
+      'INSERT OR IGNORE INTO file_hashes (hash, guild_id, channel_id, type, url, filename, file_size, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+    ).run(hash, guildId, channelId, type, url, filename, fileSize, category);
   }
 
   getChannelState(guildId: string, channelId: string): ChannelState | null {

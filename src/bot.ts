@@ -4,6 +4,7 @@ import { DiscordFetchService } from './services/discordService';
 import { MediaDownloadService } from './services/mediaDownloadService';
 import { DatabaseService } from './services/databaseService';
 import { MegaService } from './services/megaService';
+import { DeferredDownloadQueue } from './services/deferredDownloadQueue';
 import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
@@ -34,7 +35,7 @@ export function createBot(): Client {
   const db = new DatabaseService();
 
   const megaService = new MegaService();
-  megaService.connect().catch(() => {});
+  const deferredQueue = new DeferredDownloadQueue(DOWNLOAD_DIR);
 
   const noopProgress = (_progress: DownloadProgress) => {};
 
@@ -50,7 +51,26 @@ export function createBot(): Client {
     if (progress.total > 0) {
       console.log(`[${ts()}] [${progress.stage}] ${progress.message}`);
     }
-  }, DOWNLOAD_DIR, DOWNLOAD_RETRIES, megaService);
+  }, DOWNLOAD_DIR, DOWNLOAD_RETRIES, megaService, deferredQueue);
+
+  megaService.onConnect(() => {
+    downloadService.processDeferredQueue(client).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[Queue] processDeferredQueue error:', msg);
+    });
+  });
+  megaService.connect().catch(() => {});
+
+  // Fallback: if MEGA never connects, flush the deferred queue after 60s (download only, no upload)
+  setTimeout(() => {
+    if (!megaService.isConnected() && deferredQueue.count() > 0) {
+      console.log(`[Queue] MEGA not connected after 60s, flushing ${deferredQueue.count()} deferred item(s) without upload`);
+      downloadService.processDeferredQueue(client).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[Queue] fallback flush error:', msg);
+      });
+    }
+  }, 60000);
 
   client.once(Events.ClientReady, (c) => {
     console.log(`Logged in as ${c.user.tag}`);
