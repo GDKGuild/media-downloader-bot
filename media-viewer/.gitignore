@@ -1,0 +1,5 @@
+.cache/
+.pids.json
+err
+log
+start.err
