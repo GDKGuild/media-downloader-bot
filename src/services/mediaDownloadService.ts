@@ -11,6 +11,9 @@ import { isCancelled } from './cancelManager';
 import { SessionLogger } from '../utils/sessionLogger';
 import { MegaService } from './megaService';
 import { DeferredDownloadQueue, DeferredEntry } from './deferredDownloadQueue';
+import { StorageService } from './storageService';
+import { FolderRenameLogger } from '../utils/folderRenameLogger';
+import { showRenamePopup } from '../utils/folderRenamePopup';
 
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -174,11 +177,14 @@ export class MediaDownloadService {
 
   public megaService?: MegaService;
   public deferredQueue?: DeferredDownloadQueue;
+  public storageService?: StorageService;
+  public renameLogger: FolderRenameLogger;
   private processingQueue = false;
 
-  constructor(fileService: FileService, db: DatabaseService, onProgress: (progress: DownloadProgress) => void, downloadDir?: string, retries?: number, megaService?: MegaService, deferredQueue?: DeferredDownloadQueue) {
+  constructor(fileService: FileService, db: DatabaseService, onProgress: (progress: DownloadProgress) => void, downloadDir?: string, retries?: number, megaService?: MegaService, deferredQueue?: DeferredDownloadQueue, storageService?: StorageService) {
     this.megaService = megaService;
     this.deferredQueue = deferredQueue;
+    this.storageService = storageService;
     this.fileService = fileService;
     this.db = db;
     this.onProgress = onProgress;
@@ -187,6 +193,110 @@ export class MediaDownloadService {
     this.downloadDir = downloadDir || process.env.DOWNLOAD_DIR || './downloads';
     this.retries = retries ?? parseInt(process.env.DOWNLOAD_RETRIES || '3', 10);
     this.loggedKeys = this.loadLoggedKeys();
+    this.renameLogger = new FolderRenameLogger(this.downloadDir);
+  }
+
+  private resolveBaseDir(guildName: string, channelName: string, parentChannelName?: string): string {
+    if (this.storageService) {
+      return this.storageService.getBaseDir(guildName, channelName, parentChannelName);
+    }
+    return this.fileService.getBaseDir(guildName, channelName, parentChannelName);
+  }
+
+  private getRoot(): string {
+    if (this.storageService) return this.storageService.getActiveRoot();
+    return this.downloadDir;
+  }
+
+  async renameIfNeeded(
+    guildId: string,
+    channelId: string,
+    guildName: string,
+    channelName: string,
+    parentChannelName?: string | null,
+  ): Promise<string> {
+    const sGuild = sanitize(guildName);
+    const sChannel = sanitize(channelName);
+    const sParent = parentChannelName ? sanitize(parentChannelName) : undefined;
+
+    // Build expected path from current names
+    const expectedParts = [this.getRoot(), sGuild];
+    if (sParent) expectedParts.push(sParent);
+    expectedParts.push(sChannel);
+    const expectedDir = path.join(...expectedParts);
+
+    const state = this.db.getChannelState(guildId, channelId);
+
+    if (fs.existsSync(expectedDir)) {
+      // Folder exists at expected location — ensure _meta.json is present
+      const meta = this.fileService.readMeta(expectedDir);
+      if (!meta || meta.channelId !== channelId) {
+        this.fileService.writeMeta(expectedDir, channelId, guildId, sParent ?? null);
+      }
+      // Update DB names even if no rename needed (backfill for existing rows)
+      if (state && !state.channel_name) {
+        this.db.updateChannelState(guildId, channelId, state.oldest_message_id || '', state.newest_message_id || '', sGuild, sChannel, sParent ?? null);
+      }
+      return expectedDir;
+    }
+
+    // Expected folder doesn't exist — try to find by channel ID
+    const guildDir = path.join(this.getRoot(), sGuild);
+    const foundDir = this.fileService.findFolderByChannelId(guildDir, channelId);
+
+    if (foundDir) {
+      // Found existing folder with matching channel ID — rename it
+      const oldMeta = this.fileService.readMeta(foundDir);
+      const oldName = path.basename(foundDir);
+
+      // Determine old parent from found path
+      const relFromGuild = path.relative(guildDir, foundDir);
+      const relParts = relFromGuild.split(/[/\\]/);
+      const oldParentName = relParts.length > 1 ? relParts[0] : undefined;
+
+      try {
+        fs.renameSync(foundDir, expectedDir);
+        console.log(`[Rename] ${oldName} → ${sChannel} (guild: ${sGuild})`);
+      } catch (err) {
+        console.error(`[Rename] Failed to rename ${foundDir} → ${expectedDir}: ${err instanceof Error ? err.message : err}`);
+        // Fall through — create new folder
+      }
+
+      // Rename on MEGA
+      if (this.megaService?.isConnected()) {
+        const oldMegaParts = ['downloads', sGuild];
+        if (oldParentName) oldMegaParts.push(oldParentName);
+        oldMegaParts.push(oldName);
+        const oldMegaPath = oldMegaParts.join('/');
+        const newMegaParts = ['downloads', sGuild];
+        if (sParent) newMegaParts.push(sParent);
+        newMegaParts.push(sChannel);
+        const newMegaPath = newMegaParts.join('/');
+        await this.megaService.renameRemoteFolder(oldMegaPath, newMegaPath);
+      }
+
+      // Log and popup
+      this.renameLogger.logRename(
+        guildName,
+        oldMeta?.parentChannelId ? oldName : oldName,
+        channelName,
+        parentChannelName || undefined,
+        oldParentName,
+      );
+      showRenamePopup(this.renameLogger.getPopupMessage(), this.renameLogger.getLogPath());
+
+      // Update _meta.json and DB
+      this.fileService.writeMeta(expectedDir, channelId, guildId, sParent ?? null);
+      if (state) {
+        this.db.updateChannelState(guildId, channelId, state.oldest_message_id || '', state.newest_message_id || '', sGuild, sChannel, sParent ?? null);
+      }
+      return expectedDir;
+    }
+
+    // No existing folder found — create new
+    this.fileService.ensureDir(expectedDir);
+    this.fileService.writeMeta(expectedDir, channelId, guildId, sParent ?? null);
+    return expectedDir;
   }
 
   private logPath(): string {
@@ -222,6 +332,7 @@ export class MediaDownloadService {
     concurrency = 3,
     logger?: SessionLogger,
     skipUpload = false,
+    resolvedBaseDir?: string,
   ): Promise<{ mediaCount: number; outputPath: string; totalBytes: number; megaBasePath: string }> {
     const megaBasePath = parentChannelName
       ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName || '')}/${sanitize(channelName)}`
@@ -230,7 +341,7 @@ export class MediaDownloadService {
     logger?.log(`=== Download session for #${channelName} ===`);
     logger?.log(`Messages to process: ${messages.length}`);
 
-    const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
+    const baseDir = resolvedBaseDir || this.resolveBaseDir(guildName, channelName, parentChannelName);
 
     const avatarResult = await this.downloadAvatars(messages, baseDir, megaBasePath, concurrency, guildId, channelId, logger);
     logger?.log(`Avatars: ${avatarResult.count} downloaded`);
@@ -278,12 +389,8 @@ export class MediaDownloadService {
     concurrency = 3,
     skipUpload = false,
   ): Promise<{ mediaCount: number; outputPath: string; totalBytes: number }> {
-    const megaBasePath = parentChannelName
-      ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName || '')}/${sanitize(channelName)}`
-      : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
-
-    const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
-    const mediaResult = await this.downloadAttachments(messages, baseDir, megaBasePath, mediaConfig, guildId, channelId, channelName, concurrency);
+    const baseDir = this.resolveBaseDir(guildName, channelName, parentChannelName);
+    const mediaResult = await this.downloadAttachments(messages, baseDir, '', mediaConfig, guildId, channelId, channelName, concurrency);
 
     const stats = this.fileService.getDownloadStats(baseDir);
     const lines = [
@@ -308,6 +415,7 @@ export class MediaDownloadService {
     mediaConfig?: MediaConfig,
     parentChannelName?: string,
     logger?: SessionLogger,
+    resolvedBaseDir?: string,
   ): Promise<number> {
     logger?.log(`Auto-download triggered: ${message.author.tag} sent a message in #${channelName}`);
 
@@ -329,15 +437,8 @@ export class MediaDownloadService {
       return 0;
     }
 
-    const baseDir = this.fileService.getBaseDir(guildName, channelName, parentChannelName);
+    const baseDir = resolvedBaseDir || this.resolveBaseDir(guildName, channelName, parentChannelName);
     const result = await this.downloadMessageMedia(message, baseDir, 0, mediaConfig, logger);
-
-    if (result.count > 0 && this.megaService?.isConnected()) {
-      const megaBasePath = parentChannelName
-        ? `downloads/${sanitize(guildName)}/${sanitize(parentChannelName)}/${sanitize(channelName)}`
-        : `downloads/${sanitize(guildName)}/${sanitize(channelName)}`;
-      this.megaService.uploadDirectory(baseDir, megaBasePath, true).catch(() => {});
-    }
 
     logger?.log(`Auto-downloaded ${result.count} file(s) from ${message.author.tag}`);
     return result.count;
@@ -380,12 +481,22 @@ export class MediaDownloadService {
           this.deferredQueue.remove(entry);
           continue;
         }
+
+        const guildId = message.guild?.id || entry.guildId;
+        const channelId = entry.channelId;
+        const baseDir = await this.renameIfNeeded(
+          guildId, channelId,
+          entry.guildName, entry.channelName, entry.parentChannelName,
+        );
+
         const count = await this.downloadNewMessageMedia(
           message as Message,
           entry.guildName,
           entry.channelName,
           entry.mediaConfig,
           entry.parentChannelName,
+          undefined,
+          baseDir,
         );
         console.log(`[Queue] Processed deferred message ${entry.messageId}: ${count} file(s)`);
       } catch (err: unknown) {
@@ -778,6 +889,11 @@ export class MediaDownloadService {
         this.db.insertFileHash(hash, guildId || '', channelId || '', type, isDiscordCdnUrl(url) ? url : null, storedName, bytes, category === 'images' || category === 'videos' || category === 'audio' ? category : null);
 
         logger?.log(`Downloaded ${storedName} (${bytes} bytes)`);
+
+        if (this.storageService && !this.storageService.isDriveAvailable()) {
+          const relPath = path.relative(this.downloadDir, finalPath).replace(/\\/g, '/');
+          this.storageService.enqueueMigration(relPath, bytes);
+        }
 
         return { status: 'downloaded', bytes };
       } catch (err) {

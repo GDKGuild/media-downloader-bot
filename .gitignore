@@ -10,6 +10,7 @@ archive/
 archive2/
 .renamed-db/
 logs/
+graphify-out/
 *.md
 add-timestamps-report.*
 *.ps1

@@ -2,6 +2,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import filenamify from 'filenamify';
 
+const META_FILE = '_meta.json';
+
+export interface ChannelMeta {
+  channelId: string;
+  guildId: string;
+  parentChannelId: string | null;
+}
+
 export class FileService {
   private downloadDir: string;
   private maxRetries: number;
@@ -75,6 +83,48 @@ export class FileService {
 
     walk(baseDir);
     return { totalSize, fileCount };
+  }
+
+  writeMeta(baseDir: string, channelId: string, guildId: string, parentChannelId: string | null): void {
+    const meta: ChannelMeta = { channelId, guildId, parentChannelId };
+    fs.writeFileSync(path.join(baseDir, META_FILE), JSON.stringify(meta, null, 2), 'utf-8');
+  }
+
+  readMeta(baseDir: string): ChannelMeta | null {
+    const metaPath = path.join(baseDir, META_FILE);
+    if (!fs.existsSync(metaPath)) return null;
+    try {
+      const raw = fs.readFileSync(metaPath, 'utf-8');
+      const parsed = JSON.parse(raw) as ChannelMeta;
+      if (parsed.channelId) return parsed;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  findFolderByChannelId(guildDir: string, channelId: string): string | null {
+    if (!fs.existsSync(guildDir)) return null;
+    const entries = fs.readdirSync(guildDir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const folderPath = path.join(guildDir, entry.name);
+      const meta = this.readMeta(folderPath);
+      if (meta && meta.channelId === channelId) return folderPath;
+
+      // Scan one level deeper for threads
+      if (fs.existsSync(folderPath)) {
+        const subEntries = fs.readdirSync(folderPath, { withFileTypes: true });
+        for (const sub of subEntries) {
+          if (!sub.isDirectory()) continue;
+          const subPath = path.join(folderPath, sub.name);
+          const subMeta = this.readMeta(subPath);
+          if (subMeta && subMeta.channelId === channelId) return subPath;
+        }
+      }
+    }
+    return null;
   }
 }
 

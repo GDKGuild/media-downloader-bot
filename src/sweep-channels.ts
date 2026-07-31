@@ -1,4 +1,4 @@
-import { Client, GatewayIntentBits, PermissionFlagsBits, ChannelType, GuildChannel, TextChannel, NewsChannel, ThreadChannel } from 'discord.js';
+import { Client, GatewayIntentBits, PermissionFlagsBits, ChannelType, GuildChannel, TextChannel, NewsChannel, ThreadChannel, ForumChannel } from 'discord.js';
 import { config } from 'dotenv';
 
 config();
@@ -71,6 +71,13 @@ async function main() {
         if (!perms.has(PermissionFlagsBits.ReadMessageHistory)) issues.push('missing ReadMessageHistory');
         if (!perms.has(PermissionFlagsBits.SendMessages)) issues.push('missing SendMessages');
       }
+      if (entry.type === ChannelType.GuildVoice) {
+        if (!perms.has(PermissionFlagsBits.Connect)) issues.push('missing Connect');
+      }
+      if (entry.type === ChannelType.GuildForum) {
+        if (!perms.has(PermissionFlagsBits.ReadMessageHistory)) issues.push('missing ReadMessageHistory');
+        if (!perms.has(PermissionFlagsBits.SendMessages)) issues.push('missing SendMessages');
+      }
       if (entry instanceof ThreadChannel) {
         if (!perms.has(PermissionFlagsBits.ReadMessageHistory)) issues.push('missing ReadMessageHistory');
         if (!perms.has(PermissionFlagsBits.SendMessagesInThreads)) issues.push('missing SendMessagesInThreads');
@@ -89,13 +96,13 @@ async function main() {
       }
     }
 
-    // Additional threads not yet cached — fetch active + archived from each text channel
-    const textChannels = allEntries.filter(
-      (e): e is TextChannel | NewsChannel =>
-        e instanceof TextChannel || e instanceof NewsChannel
+    // Additional threads not yet cached — fetch active + archived from each text/forum channel
+    const threadParents = allEntries.filter(
+      (e): e is TextChannel | NewsChannel | ForumChannel =>
+        e instanceof TextChannel || e instanceof NewsChannel || e instanceof ForumChannel
     );
 
-    for (const ch of textChannels) {
+    for (const ch of threadParents) {
       // Active threads
       try {
         const activeThreads = await ch.threads.fetchActive();

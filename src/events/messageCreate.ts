@@ -1,4 +1,4 @@
-import { Message, TextChannel, NewsChannel, ThreadChannel, DMChannel } from 'discord.js';
+import { Message, TextChannel, NewsChannel, ThreadChannel, DMChannel, VoiceChannel } from 'discord.js';
 import { MediaDownloadService } from '../services/mediaDownloadService';
 import { MediaConfig } from '../types';
 import { extractMediaFromMessage } from '../utils/mediaUtils';
@@ -36,13 +36,13 @@ export async function handleMessageCreate(
   if (entries.length === 0 && !hasScrapeableEmbed) return;
 
   const channel = message.channel;
-  if (!(channel instanceof TextChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel || channel instanceof DMChannel)) return;
+  if (!(channel instanceof TextChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel || channel instanceof DMChannel || channel instanceof VoiceChannel)) return;
 
   const guildName = channel instanceof DMChannel
     ? `DM-${channel.recipient?.username || 'unknown'}`
-    : (channel as TextChannel | NewsChannel | ThreadChannel).guild?.name || 'Unknown';
+    : (channel as TextChannel | NewsChannel | ThreadChannel | VoiceChannel).guild?.name || 'Unknown';
 
-  const channelName = (channel as TextChannel | NewsChannel | ThreadChannel).name || channel.id;
+  const channelName = (channel as TextChannel | NewsChannel | ThreadChannel | VoiceChannel).name || channel.id;
 
   const parentChannelName = channel instanceof ThreadChannel
     ? channel.parent?.name || channel.parentId || undefined
@@ -50,6 +50,14 @@ export async function handleMessageCreate(
 
   const logger = new SessionLogger(guildName, channelName, 'auto');
   try {
+    const guildId = message.guild?.id;
+    const channelId = message.channel.id;
+
+    // Resolve folder, handling renames
+    const resolvedBaseDir = guildId
+      ? await mediaDownloadService.renameIfNeeded(guildId, channelId, guildName, channelName, parentChannelName)
+      : undefined;
+
     const count = await mediaDownloadService.downloadNewMessageMedia(
       message,
       guildName,
@@ -57,6 +65,7 @@ export async function handleMessageCreate(
       mediaConfig,
       parentChannelName,
       logger,
+      resolvedBaseDir,
     );
 
     if (count > 0) {

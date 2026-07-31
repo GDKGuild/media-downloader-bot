@@ -1,4 +1,4 @@
-import { ChatInputCommandInteraction, SlashCommandBuilder, TextChannel, NewsChannel, ThreadChannel, ChannelType, MessageFlags, Message } from 'discord.js';
+import { ChatInputCommandInteraction, SlashCommandBuilder, TextChannel, NewsChannel, ThreadChannel, VoiceChannel, ForumChannel, ChannelType, MessageFlags, Message } from 'discord.js';
 import { DiscordFetchService } from '../services/discordService';
 import { MediaDownloadService } from '../services/mediaDownloadService';
 import { FileService } from '../services/fileService';
@@ -26,7 +26,7 @@ export const data = new SlashCommandBuilder()
     option.setName('channel')
       .setDescription('Channel to scan (defaults to current)')
       .setRequired(false)
-      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread, ChannelType.PrivateThread))
+      .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread, ChannelType.PrivateThread, ChannelType.GuildVoice, ChannelType.GuildForum))
   .addStringOption(option =>
     option.setName('channels')
       .setDescription('Multiple channels: #mentions or IDs (comma-separated)')
@@ -35,27 +35,38 @@ export const data = new SlashCommandBuilder()
     option.setName('scan_all')
       .setDescription('Scan all accessible channels and active threads')
       .setRequired(false))
+  .addBooleanOption(option =>
+    option.setName('voice_only')
+      .setDescription('Scan all accessible voice channels only')
+      .setRequired(false))
+  .addBooleanOption(option =>
+    option.setName('thread_only')
+      .setDescription('Scan threads of the selected channel(s) instead of the channels (requires channel/channels)')
+      .setRequired(false))
+  .addStringOption(option =>
+    option.setName('thread')
+      .setDescription('Scan only the thread with this name in the selected channel(s)')
+      .setRequired(false))
   .addIntegerOption(option =>
     option.setName('days')
-      .setDescription('How far back to scan in days (0 = unlimited)')
+      .setDescription('Days to look back (combine with other time options)')
       .setRequired(false)
       .setMinValue(0))
   .addIntegerOption(option =>
     option.setName('hours')
-      .setDescription('How far back to scan in hours')
+      .setDescription('Hours to look back (combine with other time options)')
       .setRequired(false)
-      .setMinValue(1))
-  // TEMPORARY OPTIONS — will be removed when hours/days are sufficient
+      .setMinValue(0))
   .addIntegerOption(option =>
     option.setName('minutes')
-      .setDescription('Minutes to scan back (temporary)')
+      .setDescription('Minutes to look back (combine with other time options)')
       .setRequired(false)
-      .setMinValue(1))
+      .setMinValue(0))
   .addIntegerOption(option =>
     option.setName('seconds')
-      .setDescription('Seconds to scan back (temporary)')
+      .setDescription('Seconds to look back (combine with other time options)')
       .setRequired(false)
-      .setMinValue(1))
+      .setMinValue(0))
   .addStringOption(option =>
     option.setName('after')
       .setDescription('Download messages after this date (YYYY-MM-DD)')
@@ -108,18 +119,33 @@ export async function execute(
 
   // resolve target channels
   const scanAll = interaction.options.getBoolean('scan_all');
+  const voiceOnly = interaction.options.getBoolean('voice_only');
+  const threadOnly = interaction.options.getBoolean('thread_only');
+  const threadName = interaction.options.getString('thread');
   const channelsStr = interaction.options.getString('channels');
   const pickerChannel = interaction.options.getChannel('channel');
 
-  const targetChannels: (TextChannel | NewsChannel | ThreadChannel)[] = [];
+  // thread options only apply when channel/channels are explicitly provided
+  const useThreads = (threadOnly || !!threadName) && (!!channelsStr || !!pickerChannel);
 
-  if (scanAll) {
+  const targetChannels: (TextChannel | NewsChannel | ThreadChannel | VoiceChannel)[] = [];
+
+  const resolveThreadTargets = async (channel: TextChannel | NewsChannel | ForumChannel): Promise<ThreadChannel[]> => {
+    const threads = await fetchService.fetchChannelThreads(channel.id);
+    if (threadName) {
+      const needle = threadName.trim().toLowerCase();
+      return threads.filter(t => t.name.toLowerCase() === needle);
+    }
+    return threads;
+  };
+
+  if (voiceOnly) {
     const guild = interaction.guild;
     if (!guild) {
-      await reportStatus('`scan_all` can only be used in a server.');
+      await reportStatus('`voice_only` can only be used in a server.');
       return;
     }
-    await reportStatus('Fetching all accessible channels...');
+    await reportStatus('Fetching all accessible voice channels...');
 
     const botMember = guild.members.me;
     if (!botMember) {
@@ -128,28 +154,95 @@ export async function execute(
     }
 
     for (const ch of guild.channels.cache.values()) {
-      if (ch instanceof ThreadChannel) {
-        if (ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
-          targetChannels.push(ch);
-        }
-      } else if (ch instanceof TextChannel || ch instanceof NewsChannel) {
-        if (ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessages'])) {
-          targetChannels.push(ch);
-        }
+      if (ch instanceof VoiceChannel && ch.permissionsFor(botMember).has(['ViewChannel', 'Connect'])) {
+        targetChannels.push(ch);
       }
     }
+  } else if (scanAll) {
+    const guild = interaction.guild;
+    if (!guild) {
+      await reportStatus('`scan_all` can only be used in a server.');
+      return;
+    }
 
-    try {
-      const activeThreads = await guild.channels.fetchActiveThreads();
-      for (const th of activeThreads.threads.values()) {
-        if (!(th instanceof ThreadChannel)) continue;
-        if (targetChannels.some(t => t.id === th.id)) continue;
-        if (th.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
-          targetChannels.push(th);
+    const scanAllThreads = threadOnly || !!threadName;
+    await reportStatus(scanAllThreads ? 'Fetching all accessible threads...' : 'Fetching all accessible channels...');
+
+    const botMember = guild.members.me;
+    if (!botMember) {
+      await reportStatus('Could not determine bot permissions.');
+      return;
+    }
+
+    const pushThreadIfAccessible = (thread: ThreadChannel): void => {
+      if (thread.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
+        targetChannels.push(thread);
+      }
+    };
+
+    if (scanAllThreads) {
+      for (const ch of guild.channels.cache.values()) {
+        if (!(ch instanceof TextChannel || ch instanceof NewsChannel || ch instanceof ForumChannel)) continue;
+        if (!ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory'])) continue;
+        try {
+          const threads = await resolveThreadTargets(ch);
+          for (const thread of threads) {
+            pushThreadIfAccessible(thread);
+          }
+        } catch { /* non-critical */ }
+      }
+
+      try {
+        const activeThreads = await guild.channels.fetchActiveThreads();
+        for (const th of activeThreads.threads.values()) {
+          if (!(th instanceof ThreadChannel)) continue;
+          if (targetChannels.some(t => t.id === th.id)) continue;
+          if (threadName && th.name.toLowerCase() !== threadName.trim().toLowerCase()) continue;
+          pushThreadIfAccessible(th);
+        }
+      } catch {
+        // non-critical
+      }
+    } else {
+      for (const ch of guild.channels.cache.values()) {
+        if (ch instanceof ThreadChannel) {
+          if (ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
+            targetChannels.push(ch);
+          }
+        } else if (ch instanceof VoiceChannel) {
+          if (ch.permissionsFor(botMember).has(['ViewChannel', 'Connect'])) {
+            targetChannels.push(ch);
+          }
+        } else if (ch instanceof ForumChannel) {
+          if (ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory'])) {
+            try {
+              const threads = await fetchService.fetchForumThreads(ch.id);
+              for (const thread of threads) {
+                if (thread.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
+                  targetChannels.push(thread);
+                }
+              }
+            } catch { /* non-critical */ }
+          }
+        } else if (ch instanceof TextChannel || ch instanceof NewsChannel) {
+          if (ch.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessages'])) {
+            targetChannels.push(ch);
+          }
         }
       }
-    } catch {
-      // non-critical
+
+      try {
+        const activeThreads = await guild.channels.fetchActiveThreads();
+        for (const th of activeThreads.threads.values()) {
+          if (!(th instanceof ThreadChannel)) continue;
+          if (targetChannels.some(t => t.id === th.id)) continue;
+          if (th.permissionsFor(botMember).has(['ViewChannel', 'ReadMessageHistory', 'SendMessagesInThreads'])) {
+            targetChannels.push(th);
+          }
+        }
+      } catch {
+        // non-critical
+      }
     }
   } else if (channelsStr) {
     const ids = channelsStr.split(',').map(s => {
@@ -162,21 +255,58 @@ export async function execute(
     for (const id of ids) {
       try {
         const ch = await interaction.client.channels.fetch(id);
-        if (ch instanceof TextChannel || ch instanceof NewsChannel || ch instanceof ThreadChannel) {
+        if (ch instanceof ForumChannel) {
+          const threads = useThreads
+            ? await resolveThreadTargets(ch)
+            : await fetchService.fetchForumThreads(ch.id);
+          for (const thread of threads) {
+            targetChannels.push(thread);
+          }
+        } else if (ch instanceof TextChannel || ch instanceof NewsChannel) {
+          if (useThreads) {
+            const threads = await resolveThreadTargets(ch);
+            for (const thread of threads) {
+              targetChannels.push(thread);
+            }
+          } else {
+            targetChannels.push(ch);
+          }
+        } else if (ch instanceof ThreadChannel || ch instanceof VoiceChannel) {
           targetChannels.push(ch);
         }
       } catch {
         // skip unresolvable IDs
       }
     }
-  } else if (pickerChannel instanceof TextChannel || pickerChannel instanceof NewsChannel || pickerChannel instanceof ThreadChannel) {
-    targetChannels.push(pickerChannel);
-  } else if (currentChannel instanceof TextChannel || currentChannel instanceof NewsChannel || currentChannel instanceof ThreadChannel) {
-    targetChannels.push(currentChannel);
+  } else {
+    const source = pickerChannel || currentChannel;
+    if (source instanceof ForumChannel) {
+      const threads = useThreads
+        ? await resolveThreadTargets(source)
+        : await fetchService.fetchForumThreads(source.id);
+      for (const thread of threads) {
+        targetChannels.push(thread);
+      }
+    } else if (source instanceof TextChannel || source instanceof NewsChannel) {
+      if (useThreads) {
+        const threads = await resolveThreadTargets(source);
+        for (const thread of threads) {
+          targetChannels.push(thread);
+        }
+      } else {
+        targetChannels.push(source);
+      }
+    } else if (source instanceof ThreadChannel || source instanceof VoiceChannel) {
+      targetChannels.push(source);
+    }
   }
 
   if (targetChannels.length === 0) {
-    await reportStatus('No valid text channels specified.');
+    if (useThreads && threadName) {
+      await reportStatus(`No thread named "${threadName}" found in the selected channel(s).`);
+    } else {
+      await reportStatus('No valid channels specified.');
+    }
     return;
   }
 
@@ -187,13 +317,15 @@ export async function execute(
   const hoursOpt = interaction.options.getInteger('hours');
   const daysOpt = interaction.options.getInteger('days');
 
-  const hasMinutesOrSeconds = (minutesOpt ?? 0) > 0 || (secondsOpt ?? 0) > 0;
-  const hasCustom = hasMinutesOrSeconds || (hoursOpt ?? 0) > 0;
-
   const effectiveMinutes = minutesOpt || 0;
   const effectiveSeconds = secondsOpt || 0;
-  const effectiveHours = hasMinutesOrSeconds ? 0 : (hoursOpt || 0);
-  const effectiveDays = hasCustom ? 0 : (daysOpt ?? parseInt(process.env.MAX_BACKFILL_DAYS || '0', 10));
+  const effectiveHours = hoursOpt || 0;
+
+  // When no time params given, fall back to env var default; otherwise use explicit value
+  const hasAnyTimeParam = minutesOpt !== null || secondsOpt !== null || hoursOpt !== null || daysOpt !== null;
+  const effectiveDays = hasAnyTimeParam
+    ? (daysOpt || 0)
+    : parseInt(process.env.MAX_BACKFILL_DAYS || '0', 10);
 
   const afterStr = interaction.options.getString('after');
   const beforeStr = interaction.options.getString('before');
@@ -256,7 +388,7 @@ export async function execute(
   };
 
   const processChannel = async (
-    targetChannel: TextChannel | NewsChannel | ThreadChannel,
+    targetChannel: TextChannel | NewsChannel | ThreadChannel | VoiceChannel,
     ci: number
   ): Promise<{ messages: number; media: number; size: number; outputPath: string; baseDir: string; megaBasePath: string } | null> => {
     const channelName = targetChannel.name || targetChannel.id;
@@ -279,7 +411,15 @@ export async function execute(
         channelState = null;
       }
 
-      db.markChannelIncomplete(guildId, channelId);
+      const sGuild = guildName;
+      const sChannel = channelName;
+      const sParent = parentChannelName || null;
+      db.markChannelIncomplete(guildId, channelId, sGuild, sChannel, sParent);
+
+      // Resolve folder, handling renames
+      const resolvedBaseDir = await downloadService.renameIfNeeded(
+        guildId, channelId, guildName, channelName, parentChannelName,
+      );
 
       const hasTimeRange = effectiveDays > 0 || effectiveHours > 0 || effectiveMinutes > 0 || effectiveSeconds > 0;
       const totalReqMs = hasTimeRange
@@ -300,16 +440,12 @@ export async function execute(
         }
         // else (only after): backwardBeforeId stays undefined, starts from newest
         doBackward = true;
-      } else {
-        let cutoffTs = 0;
-        let cutoffSnowflake = '';
-        if (hasTimeRange) {
-          cutoffTs = Date.now() - totalReqMs;
-          cutoffSnowflake = timestampToSnowflake(cutoffTs);
-        }
+      } else if (hasTimeRange) {
+        const cutoffTs = Date.now() - totalReqMs;
+        const cutoffSnowflake = timestampToSnowflake(cutoffTs);
 
         if (channelState?.newest_message_id) {
-          if (hasTimeRange && BigInt(cutoffSnowflake) > BigInt(channelState.newest_message_id)) {
+          if (BigInt(cutoffSnowflake) > BigInt(channelState.newest_message_id)) {
             forwardAfterId = cutoffSnowflake;
           } else {
             forwardAfterId = channelState.newest_message_id;
@@ -317,16 +453,18 @@ export async function execute(
           doForward = true;
         }
 
-        if (hasTimeRange) {
-          if (!channelState?.oldest_message_id || BigInt(cutoffSnowflake) < BigInt(channelState.oldest_message_id)) {
-            backwardBeforeId = channelState?.oldest_message_id ?? undefined;
-            doBackward = true;
-          }
+        if (!channelState?.oldest_message_id || BigInt(cutoffSnowflake) < BigInt(channelState.oldest_message_id)) {
+          backwardBeforeId = channelState?.oldest_message_id ?? undefined;
+          doBackward = true;
         }
 
         if (!channelState) {
           doBackward = true;
         }
+      } else {
+        // No time parameters: always rescan the full history to the very beginning,
+        // regardless of previously stored scan state.
+        doBackward = true;
       }
 
       const allMessages: Message[] = [];
@@ -379,6 +517,7 @@ export async function execute(
           concurrency,
           logger,
           targetChannels.length > 1,
+          resolvedBaseDir,
         );
 
         if (allMessages.length > 0) {
@@ -388,7 +527,7 @@ export async function execute(
             if (BigInt(msg.id) < BigInt(minId)) minId = msg.id;
             if (BigInt(msg.id) > BigInt(maxId)) maxId = msg.id;
           }
-          db.updateChannelState(guildId, channelId, minId, maxId);
+          db.updateChannelState(guildId, channelId, minId, maxId, sGuild, sChannel, sParent);
         }
 
         logger.close(`#${channelName}: ${result.mediaCount} files, ${formatBytes(result.totalBytes)}`);
@@ -436,6 +575,9 @@ export async function execute(
     return;
   }
 
+  const storageLabel = downloadService.storageService?.getStorageLabel();
+  const storageLine = storageLabel ? `\n- Storage: ${storageLabel}` : '';
+
   await reportStatus(
     `Download complete!\n` +
     `- Channels: ${targetChannels.length}\n` +
@@ -444,10 +586,11 @@ export async function execute(
     `- Total size: ${formatBytes(totalSize)}\n` +
     `- Backfill: ${scopeLabel}\n` +
     (lastOutputPath ? `- Output: \`${lastOutputPath}\`` : '') +
+    storageLine +
     (hadError ? '\n- Some channels had errors (see above)' : '')
   );
 
-  if (targetChannels.length > 1 && channelResults.length > 0 && downloadService.megaService?.isConnected()) {
+  if (!downloadService.storageService && targetChannels.length > 1 && channelResults.length > 0 && downloadService.megaService?.isConnected()) {
     const total = channelResults.length;
     await reportStatus(`Downloads complete!\nUploading to MEGA... (0/${total})`);
     let uploadOk = 0;
@@ -473,11 +616,12 @@ export async function execute(
 }
 
 function buildScopeLabel(days: number, hours: number, minutes: number, seconds: number): string {
-  if (seconds > 0) return `${seconds}s`;
-  if (minutes > 0) return `${minutes}m`;
-  if (hours > 0) return `${hours}h`;
-  if (days > 0) return `${days}d`;
-  return 'all time';
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0) parts.push(`${minutes}m`);
+  if (seconds > 0) parts.push(`${seconds}s`);
+  return parts.length > 0 ? parts.join(' ') : 'all time';
 }
 
 function discordSnowflakeToTimestamp(snowflake: string): number {

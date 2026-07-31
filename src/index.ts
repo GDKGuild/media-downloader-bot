@@ -1,5 +1,5 @@
 import { config } from 'dotenv';
-import { createBot } from './bot';
+import { createBot, getActivityTracker } from './bot';
 
 config();
 
@@ -20,11 +20,17 @@ client.login(token).catch((error) => {
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  const tracker = getActivityTracker();
+  tracker.flushAll();
+  tracker.stopFlushInterval();
   client.destroy();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
+  const tracker = getActivityTracker();
+  tracker.flushAll();
+  tracker.stopFlushInterval();
   client.destroy();
   process.exit(0);
 });

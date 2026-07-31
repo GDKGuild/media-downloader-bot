@@ -6,6 +6,9 @@ export interface ChannelState {
   newest_message_id: string | null;
   last_downloaded_at: string;
   completed: boolean;
+  guild_name: string | null;
+  channel_name: string | null;
+  parent_channel_name: string | null;
 }
 
 export type FileType = 'media' | 'avatar' | 'emoji';
@@ -66,6 +69,13 @@ export class DatabaseService {
         PRIMARY KEY (guild_id, channel_id)
       )
     `);
+
+    // Migration: add name columns for folder rename tracking
+    const columns = this.db.prepare("PRAGMA table_info(channel_state)").all() as { name: string }[];
+    const colNames = new Set(columns.map(c => c.name));
+    if (!colNames.has('guild_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN guild_name TEXT');
+    if (!colNames.has('channel_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN channel_name TEXT');
+    if (!colNames.has('parent_channel_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN parent_channel_name TEXT');
   }
 
   hasFileHash(hash: string, guildId: string, channelId: string, type: FileType): boolean {
@@ -108,9 +118,12 @@ export class DatabaseService {
       newest_message_id: string | null;
       last_downloaded_at: string;
       completed: number;
+      guild_name: string | null;
+      channel_name: string | null;
+      parent_channel_name: string | null;
     }
     const row = this.db.prepare(
-      'SELECT oldest_message_id, newest_message_id, last_downloaded_at, completed FROM channel_state WHERE guild_id = ? AND channel_id = ?'
+      'SELECT oldest_message_id, newest_message_id, last_downloaded_at, completed, guild_name, channel_name, parent_channel_name FROM channel_state WHERE guild_id = ? AND channel_id = ?'
     ).get(guildId, channelId) as Row | undefined;
     if (!row) return null;
     return {
@@ -118,19 +131,38 @@ export class DatabaseService {
       newest_message_id: row.newest_message_id,
       last_downloaded_at: row.last_downloaded_at,
       completed: row.completed === 1,
+      guild_name: row.guild_name,
+      channel_name: row.channel_name,
+      parent_channel_name: row.parent_channel_name,
     };
   }
 
-  updateChannelState(guildId: string, channelId: string, oldestMessageId: string, newestMessageId: string): void {
+  updateChannelState(
+    guildId: string,
+    channelId: string,
+    oldestMessageId: string,
+    newestMessageId: string,
+    guildName?: string,
+    channelName?: string,
+    parentChannelName?: string | null,
+  ): void {
     this.db.prepare(`
-      INSERT INTO channel_state (guild_id, channel_id, oldest_message_id, newest_message_id, completed, last_downloaded_at)
-      VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+      INSERT INTO channel_state (guild_id, channel_id, oldest_message_id, newest_message_id, completed, last_downloaded_at, guild_name, channel_name, parent_channel_name)
+      VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?)
       ON CONFLICT(guild_id, channel_id) DO UPDATE SET
         oldest_message_id = ?,
         newest_message_id = ?,
         completed = 1,
-        last_downloaded_at = CURRENT_TIMESTAMP
-    `).run(guildId, channelId, oldestMessageId, newestMessageId, oldestMessageId, newestMessageId);
+        last_downloaded_at = CURRENT_TIMESTAMP,
+        guild_name = COALESCE(?, guild_name),
+        channel_name = COALESCE(?, channel_name),
+        parent_channel_name = COALESCE(?, parent_channel_name)
+    `).run(
+      guildId, channelId, oldestMessageId, newestMessageId,
+      guildName ?? null, channelName ?? null, parentChannelName ?? null,
+      oldestMessageId, newestMessageId,
+      guildName ?? null, channelName ?? null, parentChannelName ?? null,
+    );
   }
 
   updateOldestMessageId(guildId: string, channelId: string, oldestMessageId: string): void {
@@ -144,12 +176,26 @@ export class DatabaseService {
     `).run(guildId, channelId, oldestMessageId, oldestMessageId);
   }
 
-  markChannelIncomplete(guildId: string, channelId: string): void {
+  markChannelIncomplete(
+    guildId: string,
+    channelId: string,
+    guildName?: string,
+    channelName?: string,
+    parentChannelName?: string | null,
+  ): void {
     this.db.prepare(`
-      INSERT INTO channel_state (guild_id, channel_id, completed)
-      VALUES (?, ?, 0)
-      ON CONFLICT(guild_id, channel_id) DO UPDATE SET completed = 0
-    `).run(guildId, channelId);
+      INSERT INTO channel_state (guild_id, channel_id, completed, guild_name, channel_name, parent_channel_name)
+      VALUES (?, ?, 0, ?, ?, ?)
+      ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+        completed = 0,
+        guild_name = COALESCE(?, guild_name),
+        channel_name = COALESCE(?, channel_name),
+        parent_channel_name = COALESCE(?, parent_channel_name)
+    `).run(
+      guildId, channelId,
+      guildName ?? null, channelName ?? null, parentChannelName ?? null,
+      guildName ?? null, channelName ?? null, parentChannelName ?? null,
+    );
   }
 
   close(): void {

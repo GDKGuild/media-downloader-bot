@@ -10,7 +10,8 @@
     "register-commands": "tsx src/register-commands.ts",
     "sync-db": "tsx src/sync-db.ts",
     "sweep": "tsx src/sweep-channels.ts",
-    "migrate-mega": "tsx src/migrate-to-mega.ts"
+    "migrate-mega": "tsx src/migrate-to-mega.ts",
+    "migrate-drive": "tsx src/migrate-to-drive.ts"
   },
   "dependencies": {
     "axios": "^1.7.9",

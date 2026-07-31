@@ -1,4 +1,4 @@
-import { Client, Collection, Message, TextChannel, DMChannel, NewsChannel, ThreadChannel } from 'discord.js';
+import { Client, Collection, Message, TextChannel, DMChannel, NewsChannel, ThreadChannel, VoiceChannel, ForumChannel, Routes, ChannelType } from 'discord.js';
 import { DownloadProgress, FetchOptions } from '../types';
 import { shouldDownloadFile, countMedia } from '../utils/mediaUtils';
 import { isCancelled } from './cancelManager';
@@ -24,8 +24,10 @@ export class DiscordFetchService {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
 
-    if (!(channel instanceof TextChannel || channel instanceof DMChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel)) {
-      throw new Error(`Channel ${channelId} is not a text-based channel`);
+    const isVoice = channel instanceof VoiceChannel;
+    const isTextBased = channel instanceof TextChannel || channel instanceof DMChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel;
+    if (!isVoice && !isTextBased) {
+      throw new Error(`Channel ${channelId} is not a text-based or voice channel`);
     }
 
     const allMessages: Message[] = [];
@@ -50,15 +52,20 @@ export class DiscordFetchService {
         break;
       }
 
-      const fetchOpts: { limit: number; before?: string } = { limit: 100 };
-      if (lastId) fetchOpts.before = lastId;
+      let messageArray: Message[];
 
-      const messages = await channel.messages.fetch(fetchOpts);
-      const count = messages.size;
+      if (isVoice) {
+        messageArray = await this.fetchVoiceChannelMessages(channelId, 100, lastId);
+      } else {
+        const fetchOpts: { limit: number; before?: string } = { limit: 100 };
+        if (lastId) fetchOpts.before = lastId;
+        const messages = await (channel as TextChannel | DMChannel | NewsChannel | ThreadChannel).messages.fetch(fetchOpts);
+        messageArray = Array.from(messages.values());
+      }
+
+      const count = messageArray.length;
 
       if (count === 0) break;
-
-      const messageArray = Array.from(messages.values());
 
       // Upper bound: skip batches where even the oldest message is newer than beforeTimestamp
       if (upperBound > 0 && messageArray[messageArray.length - 1].createdTimestamp > upperBound) {
@@ -126,8 +133,11 @@ export class DiscordFetchService {
   ): Promise<FetchResult> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel) throw new Error(`Channel ${channelId} not found`);
-    if (!(channel instanceof TextChannel || channel instanceof DMChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel)) {
-      throw new Error(`Channel ${channelId} is not a text-based channel`);
+
+    const isVoice = channel instanceof VoiceChannel;
+    const isTextBased = channel instanceof TextChannel || channel instanceof DMChannel || channel instanceof NewsChannel || channel instanceof ThreadChannel;
+    if (!isVoice && !isTextBased) {
+      throw new Error(`Channel ${channelId} is not a text-based or voice channel`);
     }
 
     const allMessages: Message[] = [];
@@ -137,11 +147,18 @@ export class DiscordFetchService {
     for (;;) {
       if (isCancelled(channelId)) break;
 
-      const messages = await channel.messages.fetch({ after: lastId, limit: 100 });
-      const count = messages.size;
+      let messageArray: Message[];
+
+      if (isVoice) {
+        messageArray = await this.fetchVoiceChannelMessages(channelId, 100, undefined, lastId);
+      } else {
+        const messages = await (channel as TextChannel | DMChannel | NewsChannel | ThreadChannel).messages.fetch({ after: lastId, limit: 100 });
+        messageArray = Array.from(messages.values());
+      }
+
+      const count = messageArray.length;
       if (count === 0) break;
 
-      const messageArray = Array.from(messages.values());
       allMessages.push(...messageArray);
       mediaCount += countMedia(messageArray);
 
@@ -160,6 +177,76 @@ export class DiscordFetchService {
     }
 
     return { messages: allMessages, mediaCount };
+  }
+
+  async fetchForumThreads(channelId: string): Promise<ThreadChannel[]> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !(channel instanceof ForumChannel)) {
+      throw new Error(`Channel ${channelId} is not a forum channel`);
+    }
+
+    const threads: ThreadChannel[] = [];
+
+    try {
+      const active = await channel.threads.fetchActive();
+      threads.push(...active.threads.values());
+    } catch { /* non-critical */ }
+
+    try {
+      let archived = await channel.threads.fetchArchived();
+      threads.push(...archived.threads.values());
+      while (archived.hasMore && archived.threads.size > 0) {
+        archived = await channel.threads.fetchArchived({ before: archived.threads.lastKey()! });
+        threads.push(...archived.threads.values());
+      }
+    } catch { /* non-critical */ }
+
+    return threads;
+  }
+
+  async fetchChannelThreads(channelId: string): Promise<ThreadChannel[]> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel) return [];
+    if (channel instanceof ForumChannel) {
+      return this.fetchForumThreads(channelId);
+    }
+    if (!(channel instanceof TextChannel || channel instanceof NewsChannel)) {
+      return [];
+    }
+
+    const threads: ThreadChannel[] = [];
+
+    try {
+      const active = await channel.threads.fetchActive();
+      threads.push(...active.threads.values());
+    } catch { /* non-critical */ }
+
+    try {
+      let archived = await channel.threads.fetchArchived();
+      threads.push(...archived.threads.values());
+      while (archived.hasMore && archived.threads.size > 0) {
+        archived = await channel.threads.fetchArchived({ before: archived.threads.lastKey()! });
+        threads.push(...archived.threads.values());
+      }
+    } catch { /* non-critical */ }
+
+    return threads;
+  }
+
+  private async fetchVoiceChannelMessages(
+    channelId: string,
+    limit: number,
+    before?: string,
+    after?: string,
+  ): Promise<Message[]> {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (before) params.set('before', before);
+    if (after) params.set('after', after);
+
+    const data = await this.client.rest.get(Routes.channelMessages(channelId), { query: params });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const MessageCtor = Message as unknown as new (client: Client, data: any) => Message;
+    return (data as unknown[]).map((raw) => new MessageCtor(this.client, raw));
   }
 
   async fetchGuildChannels(guildId: string): Promise<Collection<string, TextChannel>> {

@@ -325,4 +325,54 @@ export class MegaService {
       return current;
     });
   }
+
+  async renameRemoteFolder(oldPath: string, newPath: string): Promise<boolean> {
+    if (!this.storage) return false;
+    try {
+      const oldParts = oldPath.split(/[/\\]+/).filter(Boolean);
+      const newParts = newPath.split(/[/\\]+/).filter(Boolean);
+      const newName = newParts[newParts.length - 1];
+
+      const remoteBase = await this.mkdirRecursive(this.storage.root, this.rootFolder);
+      let current = remoteBase;
+      for (const part of oldParts) {
+        const existing = current.children?.find((c: any) => c.name === part && c.directory);
+        if (!existing) {
+          console.log(`[MEGA] Rename skipped: old folder "${oldPath}" not found`);
+          return false;
+        }
+        current = existing;
+      }
+
+      // Check if a folder with the new name already exists as a sibling
+      const parent = oldParts.length > 1
+        ? await this.findRemoteParent(remoteBase, oldParts.slice(0, -1))
+        : remoteBase;
+      if (parent) {
+        const conflict = parent.children?.find((c: any) => c.name === newName && c.directory && c.nodeId !== current.nodeId);
+        if (conflict) {
+          console.log(`[MEGA] Rename skipped: "${newName}" already exists`);
+          return false;
+        }
+      }
+
+      await current.rename(newName);
+      this.dirCache.clear();
+      console.log(`[MEGA] Renamed: ${oldPath} → ${newPath}`);
+      return true;
+    } catch (err) {
+      console.error(`[MEGA] Rename failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  private async findRemoteParent(remoteBase: any, parts: string[]): Promise<any> {
+    let current = remoteBase;
+    for (const part of parts) {
+      const existing = current.children?.find((c: any) => c.name === part && c.directory);
+      if (!existing) return null;
+      current = existing;
+    }
+    return current;
+  }
 }
