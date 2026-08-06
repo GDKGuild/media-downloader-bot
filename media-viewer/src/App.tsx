@@ -17,7 +17,7 @@ export function App() {
   const [categoryFilter, setCategoryFilter] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortMode, setSortMode] = useState<SortMode>('name');
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [previewFile, setPreviewFile] = useState<FileEntry | null>(null);
   const selectedPathRef = useRef<string | null>(null);
 

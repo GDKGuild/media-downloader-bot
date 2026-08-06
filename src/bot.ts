@@ -21,9 +21,15 @@ const defaultMediaConfig: MediaConfig = {
 };
 
 let activityTracker: ActivityTracker;
+let currentStorageService: StorageService | undefined;
 
 export function getActivityTracker(): ActivityTracker {
   return activityTracker;
+}
+
+export function disposeBot(): void {
+  currentStorageService?.stopPolling();
+  currentStorageService = undefined;
 }
 
 export function createBot(): Client {
@@ -48,6 +54,7 @@ export function createBot(): Client {
   const storageService = USE_EXTERNAL_DRIVE
     ? new StorageService(EXTERNAL_DRIVE_PATH, DOWNLOAD_DIR, EXTERNAL_DRIVE_LABEL)
     : undefined;
+  currentStorageService = storageService;
 
   let megaService: MegaService | undefined;
   let deferredQueue: DeferredDownloadQueue | undefined;
@@ -120,8 +127,8 @@ export function createBot(): Client {
   client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
-    const ownerId = process.env.BOT_OWNER_ID;
-    if (ownerId && interaction.user.id !== ownerId) {
+    const ownerIds = (process.env.BOT_OWNER_ID ?? '').split(',').map((id) => id.trim()).filter(Boolean);
+    if (ownerIds.length > 0 && !ownerIds.includes(interaction.user.id)) {
       await interaction.reply({ content: 'Only the bot owner can use this command.', flags: MessageFlags.Ephemeral });
       return;
     }
