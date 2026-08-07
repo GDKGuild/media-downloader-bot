@@ -1,7 +1,6 @@
 import { Client, TextChannel, Message } from 'discord.js';
 import axios from 'axios';
 import { DatabaseService, MonitorAuthorRow } from './databaseService';
-import { MediaDownloadService } from './mediaDownloadService';
 
 const API_BASE = 'https://api.fxtwitter.com/2/profile';
 const API_STATUS = 'https://api.fxtwitter.com/2/status';
@@ -163,15 +162,13 @@ export async function fetchLatestTweet(username: string): Promise<MonitorTweet |
 export class TweetMonitorService {
   private client: Client;
   private db: DatabaseService;
-  private mediaDownload: MediaDownloadService;
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
   private pendingAwait = new Map<string, { expiresAt: number; channelId: string; requesterId: string; timer: NodeJS.Timeout }>();
 
-  constructor(client: Client, db: DatabaseService, mediaDownload: MediaDownloadService) {
+  constructor(client: Client, db: DatabaseService) {
     this.client = client;
     this.db = db;
-    this.mediaDownload = mediaDownload;
   }
 
   armAwait(guildId: string, channelId: string, requesterId: string, minutes: number): void {
@@ -451,7 +448,6 @@ export class TweetMonitorService {
         console.error(`[Monitor] Relay @${author.username}/${newestId} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    void this.downloadTweetMediaQuietly(newest, newest.author?.screen_name ?? author.username);
     this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
     console.log(`[Monitor] @${author.username}: ${posted ? 'relayed' : 'tracked'} newest post ${newestId}`);
   }
@@ -485,15 +481,5 @@ export class TweetMonitorService {
       // swallow — lastErr carries the original failure
     }
     throw lastErr ?? new Error('all fixers failed');
-  }
-
-  private async downloadTweetMediaQuietly(tweet: MonitorTweet, username: string): Promise<void> {
-    const media = tweet.media?.all ?? [];
-    if (media.length === 0) return;
-    try {
-      await this.mediaDownload.downloadTweetMedia(username, String(tweet.id), media, tweet.created_timestamp);
-    } catch (err) {
-      console.error(`[Monitor] Download @${username}/${tweet.id} failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 }

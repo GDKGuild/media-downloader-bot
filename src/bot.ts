@@ -97,7 +97,7 @@ export function createBot(): Client {
     }
   }, DOWNLOAD_DIR, DOWNLOAD_RETRIES, megaService, deferredQueue, storageService);
 
-  tweetMonitor = new TweetMonitorService(client, db, downloadService);
+  tweetMonitor = new TweetMonitorService(client, db);
 
   const activityConfig: ActivityConfig = {
     advancedMode: process.env.ADVANCED_TRACKING === 'true',

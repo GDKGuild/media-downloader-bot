@@ -452,58 +452,6 @@ export class MediaDownloadService {
     this.seenHashes.clear();
   }
 
-  async downloadTweetMedia(
-    username: string,
-    tweetId: string,
-    mediaItems: { url: string; type: string }[],
-    createdTimestamp?: number,
-  ): Promise<number> {
-    const items = mediaItems.filter((m) => m.url && (m.type === 'photo' || m.type === 'video'));
-    if (items.length === 0) return 0;
-
-    const baseDir = path.join(this.getRoot(), 'Twitter', sanitize(username));
-    const guildId = 'twitter';
-    const channelId = `twitter:${username}`;
-    const ts = createdTimestamp ? createdTimestamp * 1000 : Date.now();
-    let downloaded = 0;
-
-    for (let i = 0; i < items.length; i += 3) {
-      const batch = items.slice(i, i + 3);
-      const results = await Promise.allSettled(
-        batch.map(async (item, j) => {
-          const isVideo = item.type === 'video';
-          const category: MediaCategory = isVideo ? 'videos' : 'images';
-          const mediaDir = this.fileService.getMediaDir(baseDir, category);
-          const filename = `${tweetId}_${i + j + 1}`;
-          const ext = extFromUrl(item.url, isVideo ? 'mp4' : 'jpg');
-          return this.downloadWithDedup(
-            item.url,
-            null,
-            mediaDir,
-            filename,
-            category,
-            ext,
-            guildId,
-            channelId,
-            undefined,
-            ts,
-            undefined,
-            'media',
-          );
-        })
-      );
-
-      for (const r of results) {
-        if (r.status === 'fulfilled' && r.value.status === 'downloaded') downloaded++;
-      }
-    }
-
-    if (downloaded > 0) {
-      console.log(`[Monitor] Downloaded ${downloaded} file(s) from @${username} tweet ${tweetId} → ${baseDir}`);
-    }
-    return downloaded;
-  }
-
   async processDeferredQueue(client: Client): Promise<void> {
     if (this.processingQueue || !this.deferredQueue) return;
     this.processingQueue = true;

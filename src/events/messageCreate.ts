@@ -12,7 +12,10 @@ export async function handleMessageCreate(
   mediaConfig: MediaConfig
 ): Promise<void> {
   if (!AUTO_DOWNLOAD) return;
-  if (message.author.bot) return;
+  const isOwnRelay = message.author.bot
+    && message.author.id === message.client.user?.id
+    && /https?:\/\/[^\s]+\/status\/\d+/i.test(message.content);
+  if (message.author.bot && !isOwnRelay) return;
 
   const hasUrls = /https?:\/\/[^\s]+/.test(message.content);
 
