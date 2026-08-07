@@ -32,6 +32,13 @@ function sleep(ms: number): Promise<void> {
 
 function buildClient(): Client {
   disposeBot();
+  if (client) {
+    try {
+      void client.destroy();
+    } catch {
+      // ignore
+    }
+  }
   client = createBot();
   client.on(Events.ShardError, (error) => {
     console.error(`[Connection] Shard error: ${error instanceof Error ? error.message : String(error)}`);
