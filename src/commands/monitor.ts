@@ -253,7 +253,7 @@ export async function handleVerifySelect(
     if (result.reason === 'identity-mismatch') {
       message = `Cannot verify @${author.username} — the handle now belongs to a different account than the tracked user \`${author.user_id}\` (handle recycled). Remove it and re-add the author with the current handle.`;
     } else if (!result.found) {
-      message = `@${author.username} has no posts (or could not be fetched).`;
+      message = `@${author.username} has no posts with media (or could not be fetched).`;
     } else if (!result.channelId) {
       message = `@${author.username}'s latest post is \`${result.tweetId}\`, but no target channel is set. Run \`/monitor channel\` first.`;
     } else {
@@ -299,7 +299,7 @@ async function handleVerifyAll(
       case 'posted': return `\`@${e.username}\` → sent \`${e.tweetId}\``;
       case 'skipped': return `\`@${e.username}\` → skipped (already up to date)`;
       case 'identity-mismatch': return `\`@${e.username}\` → handle now belongs to a different account; remove and re-add`;
-      case 'no-posts': return `\`@${e.username}\` → no posts found`;
+      case 'no-posts': return `\`@${e.username}\` → no posts with media found`;
       case 'no-channel': return `\`@${e.username}\` → no channel set`;
       default: return `\`@${e.username}\` → failed`;
     }

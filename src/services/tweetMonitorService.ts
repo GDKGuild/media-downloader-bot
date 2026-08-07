@@ -21,6 +21,9 @@ export interface MonitorTweet {
   created_timestamp?: number;
   media?: { all?: MonitorTweetMedia[] };
   author?: { id?: string; screen_name?: string };
+  quote?: MonitorTweet;
+  replying_to?: { screen_name?: string; status?: string | number; url?: string } | null;
+  reposted_by?: { id?: string; screen_name?: string } | null;
 }
 
 export interface MonitorVerifyAllEntry {
@@ -58,6 +61,45 @@ export function normalizeUsername(raw: string): string | null {
   const cleaned = raw.trim().replace(/^@/, '');
   if (!/^[a-zA-Z0-9_]{1,15}$/.test(cleaned)) return null;
   return cleaned;
+}
+
+export function hasMedia(tweet: MonitorTweet): boolean {
+  const all = tweet.media?.all;
+  return !!all && all.length > 0;
+}
+
+export async function replyParentHasMedia(tweet: MonitorTweet): Promise<boolean> {
+  const parentId = tweet.replying_to?.status;
+  if (!parentId) return false;
+  try {
+    const res = await axios.get(`${API_STATUS}/${encodeURIComponent(String(parentId))}`, {
+      timeout: 15000,
+      headers: { 'User-Agent': BROWSER_UA, 'Accept': 'application/json' },
+      validateStatus: (s) => s === 200 || s === 404,
+    });
+    if (res.status !== 200) return false;
+    const data = res.data as { status?: MonitorTweet } | undefined;
+    return hasMedia(data?.status as MonitorTweet);
+  } catch {
+    return false;
+  }
+}
+
+export async function isIncludeable(tweet: MonitorTweet): Promise<boolean> {
+  if (hasMedia(tweet)) return true;
+  if (tweet.replying_to?.status) return await replyParentHasMedia(tweet);
+  return false;
+}
+
+export function tweetIdentity(tweet: MonitorTweet): { id: string | null; screen_name: string | null } {
+  return {
+    id: tweet.reposted_by?.id ?? tweet.author?.id ?? null,
+    screen_name: tweet.reposted_by?.screen_name ?? tweet.author?.screen_name ?? null,
+  };
+}
+
+function swapDomain(url: string, domain: string): string {
+  return url.replace(/^https?:\/\/(?:www\.)?(?:x|twitter)\.com/i, `https://${domain}`);
 }
 
 export async function resolveProfile(username: string): Promise<ProfileInfo | null> {
@@ -109,7 +151,10 @@ export async function fetchLatestTweet(username: string): Promise<MonitorTweet |
     const data = res.data as { code?: number; results?: unknown[] } | undefined;
     if (!data || data.code !== 200 || !Array.isArray(data.results)) return null;
     const tweets = data.results.filter((r): r is MonitorTweet => !!r && typeof r === 'object' && (r as MonitorTweet).type === 'status');
-    return tweets[0] ?? null;
+    for (const tweet of tweets) {
+      if (await isIncludeable(tweet)) return tweet;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -245,7 +290,7 @@ export class TweetMonitorService {
     const tweet = await fetchLatestTweet(author.username);
     if (!tweet) return { found: false, tweetId: null, channelId: null, posted: false };
 
-    const tweetAuthorId = tweet.author?.id ?? null;
+    const tweetAuthorId = tweetIdentity(tweet).id;
     if (author.user_id && (!tweetAuthorId || author.user_id !== tweetAuthorId)) {
       return { found: false, tweetId: String(tweet.id), channelId: null, posted: false, reason: 'identity-mismatch' };
     }
@@ -275,7 +320,7 @@ export class TweetMonitorService {
         const tweet = await fetchLatestTweet(author.username);
         if (tweet) {
           entry.tweetId = String(tweet.id);
-          const tweetAuthorId = tweet.author?.id ?? null;
+          const tweetAuthorId = tweetIdentity(tweet).id;
           const identityOk = !author.user_id || (tweetAuthorId && author.user_id === tweetAuthorId);
           if (!identityOk) {
             entry.status = 'identity-mismatch';
@@ -354,7 +399,13 @@ export class TweetMonitorService {
     if (res.status === 404) throw new Error('handle not found');
     const data = res.data as { code?: number; results?: unknown[] } | undefined;
     if (!data || data.code !== 200 || !Array.isArray(data.results)) return [];
-    return data.results.filter((r): r is MonitorTweet => !!r && typeof r === 'object' && (r as MonitorTweet).type === 'status');
+    const tweets = data.results.filter((r): r is MonitorTweet =>
+      !!r && typeof r === 'object' && (r as MonitorTweet).type === 'status');
+    const includeable: MonitorTweet[] = [];
+    for (const tweet of tweets) {
+      if (await isIncludeable(tweet)) includeable.push(tweet);
+    }
+    return includeable;
   }
 
   private async pollAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
@@ -364,16 +415,15 @@ export class TweetMonitorService {
     const newest = tweets[0];
     const newestId = String(newest.id);
     const newestTs = newest.created_timestamp ?? 0;
-    const newestAuthorId = newest.author?.id ?? null;
-    const newestAuthorName = newest.author?.screen_name ?? null;
+    const newestIdentity = tweetIdentity(newest);
+    const newestAuthorId = newestIdentity.id;
+    const newestAuthorName = newestIdentity.screen_name;
 
     if (author.user_id && newestAuthorId && author.user_id !== newestAuthorId) {
-      console.warn(`[Monitor] @${author.username} now belongs to user ${newestAuthorId} (expected ${author.user_id}) — handle likely recycled. Skipping poll; remove and re-add the correct account if needed.`);
       return;
     }
 
     if (author.user_id && !newestAuthorId) {
-      console.warn(`[Monitor] @${author.username}: newest post has no author id — cannot confirm identity. Skipping poll.`);
       return;
     }
 
@@ -384,10 +434,8 @@ export class TweetMonitorService {
 
     if (author.user_id && newestAuthorName && newestAuthorName !== author.username) {
       if (this.db.renameMonitorAuthor(guildId, author.username, newestAuthorName)) {
-        console.log(`[Monitor] @${author.username} is now @${newestAuthorName} — updated`);
         author.username = newestAuthorName;
       } else {
-        console.warn(`[Monitor] Could not rename @${author.username} to @${newestAuthorName} (name conflict?) — skipping poll`);
         return;
       }
     }
@@ -403,14 +451,14 @@ export class TweetMonitorService {
         console.error(`[Monitor] Relay @${author.username}/${newestId} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    void this.downloadTweetMediaQuietly(newest, author.username);
+    void this.downloadTweetMediaQuietly(newest, newest.author?.screen_name ?? author.username);
     this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
     console.log(`[Monitor] @${author.username}: ${posted ? 'relayed' : 'tracked'} newest post ${newestId}`);
   }
 
   private async relayTweet(tweet: MonitorTweet, username: string, channelId: string, guildId: string): Promise<void> {
     const tweetId = String(tweet.id);
-    const rawLink = `https://x.com/${username}/status/${tweetId}`;
+    const rawLink = tweet.url || `https://x.com/${username}/status/${tweetId}`;
     const channel = await this.client.channels.fetch(channelId).catch(() => null);
     if (!channel || !channel.isTextBased()) {
       throw new Error(`target channel ${channelId} is not available`);
@@ -419,7 +467,7 @@ export class TweetMonitorService {
 
     let lastErr: unknown = null;
     for (const fixer of this.getFixers(guildId)) {
-      const fixed = `https://${fixer}/${username}/status/${tweetId}`;
+      const fixed = swapDomain(rawLink, fixer);
       try {
         await target.send(fixed);
         console.log(`[Monitor] Relayed @${username}/${tweetId} via ${fixer}`);
