@@ -25,6 +25,22 @@ export interface FileHashRow {
   created_at: string;
 }
 
+export interface MonitorAuthorRow {
+  username: string;
+  user_id: string | null;
+  last_tweet_id: string | null;
+  last_tweet_ts: number | null;
+  active: number;
+  added_at: string;
+}
+
+export interface MonitorSeenTweetRow {
+  tweet_id: string;
+  username: string;
+  created_timestamp: number | null;
+  processed_at: string;
+}
+
 export class DatabaseService {
   private db: Database.Database;
 
@@ -76,6 +92,112 @@ export class DatabaseService {
     if (!colNames.has('guild_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN guild_name TEXT');
     if (!colNames.has('channel_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN channel_name TEXT');
     if (!colNames.has('parent_channel_name')) this.db.exec('ALTER TABLE channel_state ADD COLUMN parent_channel_name TEXT');
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS monitor_authors (
+        guild_id TEXT NOT NULL DEFAULT '',
+        username TEXT NOT NULL,
+        user_id TEXT,
+        last_tweet_id TEXT,
+        last_tweet_ts INTEGER,
+        active INTEGER DEFAULT 1,
+        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (guild_id, username)
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS monitor_seen_tweets (
+        guild_id TEXT NOT NULL DEFAULT '',
+        tweet_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        created_timestamp INTEGER,
+        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (guild_id, tweet_id)
+      )
+    `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS monitor_config (
+        guild_id TEXT NOT NULL DEFAULT '',
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY (guild_id, key)
+      )
+    `);
+
+    this.migrateMonitorTables();
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_monitor_seen_guild_username_ts
+        ON monitor_seen_tweets(guild_id, username, created_timestamp)
+    `);
+  }
+
+  private migrateMonitorTables(): void {
+    const hasTable = (name: string): boolean =>
+      !!this.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
+    const columns = (name: string): string[] =>
+      (this.db.prepare(`PRAGMA table_info(${name})`).all() as { name: string }[]).map((c) => c.name);
+
+    if (hasTable('monitor_authors') && !columns('monitor_authors').includes('guild_id')) {
+      this.db.exec('ALTER TABLE monitor_authors RENAME TO monitor_authors_old');
+      this.db.exec(`
+        CREATE TABLE monitor_authors (
+          guild_id TEXT NOT NULL DEFAULT '',
+          username TEXT NOT NULL,
+          user_id TEXT,
+          last_tweet_id TEXT,
+          last_tweet_ts INTEGER,
+          active INTEGER DEFAULT 1,
+          added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (guild_id, username)
+        )
+      `);
+      this.db.exec(`
+        INSERT INTO monitor_authors (guild_id, username, user_id, last_tweet_id, last_tweet_ts, active, added_at)
+        SELECT '', username, NULL, last_tweet_id, last_tweet_ts, active, added_at FROM monitor_authors_old
+      `);
+      this.db.exec('DROP TABLE monitor_authors_old');
+    } else if (hasTable('monitor_authors') && !columns('monitor_authors').includes('user_id')) {
+      this.db.exec('ALTER TABLE monitor_authors ADD COLUMN user_id TEXT');
+    }
+
+    if (hasTable('monitor_seen_tweets') && !columns('monitor_seen_tweets').includes('guild_id')) {
+      this.db.exec('ALTER TABLE monitor_seen_tweets RENAME TO monitor_seen_tweets_old');
+      this.db.exec(`
+        CREATE TABLE monitor_seen_tweets (
+          guild_id TEXT NOT NULL DEFAULT '',
+          tweet_id TEXT NOT NULL,
+          username TEXT NOT NULL,
+          created_timestamp INTEGER,
+          processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (guild_id, tweet_id)
+        )
+      `);
+      this.db.exec(`
+        INSERT INTO monitor_seen_tweets (guild_id, tweet_id, username, created_timestamp, processed_at)
+        SELECT '', tweet_id, username, created_timestamp, processed_at FROM monitor_seen_tweets_old
+      `);
+      this.db.exec('DROP TABLE monitor_seen_tweets_old');
+    }
+
+    if (hasTable('monitor_config') && !columns('monitor_config').includes('guild_id')) {
+      this.db.exec('ALTER TABLE monitor_config RENAME TO monitor_config_old');
+      this.db.exec(`
+        CREATE TABLE monitor_config (
+          guild_id TEXT NOT NULL DEFAULT '',
+          key TEXT NOT NULL,
+          value TEXT NOT NULL,
+          PRIMARY KEY (guild_id, key)
+        )
+      `);
+      this.db.exec(`
+        INSERT INTO monitor_config (guild_id, key, value)
+        SELECT '', key, value FROM monitor_config_old
+      `);
+      this.db.exec('DROP TABLE monitor_config_old');
+    }
   }
 
   hasFileHash(hash: string, guildId: string, channelId: string, type: FileType): boolean {
@@ -196,6 +318,87 @@ export class DatabaseService {
       guildName ?? null, channelName ?? null, parentChannelName ?? null,
       guildName ?? null, channelName ?? null, parentChannelName ?? null,
     );
+  }
+
+  listMonitorGuilds(): string[] {
+    return (this.db.prepare('SELECT DISTINCT guild_id FROM monitor_authors').all() as { guild_id: string }[])
+      .map((r) => r.guild_id);
+  }
+
+  listMonitorAuthors(guildId: string): MonitorAuthorRow[] {
+    return this.db.prepare(
+      'SELECT username, user_id, last_tweet_id, last_tweet_ts, active, added_at FROM monitor_authors WHERE guild_id = ? AND active = 1 ORDER BY added_at'
+    ).all(guildId) as MonitorAuthorRow[];
+  }
+
+  getMonitorAuthor(guildId: string, username: string): MonitorAuthorRow | null {
+    const row = this.db.prepare(
+      'SELECT username, user_id, last_tweet_id, last_tweet_ts, active, added_at FROM monitor_authors WHERE guild_id = ? AND username = ?'
+    ).get(guildId, username) as MonitorAuthorRow | undefined;
+    return row || null;
+  }
+
+  findMonitorAuthorCI(guildId: string, username: string): MonitorAuthorRow | null {
+    const row = this.db.prepare(
+      'SELECT username, user_id, last_tweet_id, last_tweet_ts, active, added_at FROM monitor_authors WHERE guild_id = ? AND lower(username) = lower(?)'
+    ).get(guildId, username) as MonitorAuthorRow | undefined;
+    return row || null;
+  }
+
+  findMonitorAuthorByUserId(guildId: string, userId: string): MonitorAuthorRow | null {
+    const row = this.db.prepare(
+      'SELECT username, user_id, last_tweet_id, last_tweet_ts, active, added_at FROM monitor_authors WHERE guild_id = ? AND user_id = ?'
+    ).get(guildId, userId) as MonitorAuthorRow | undefined;
+    return row || null;
+  }
+
+  addMonitorAuthor(guildId: string, username: string, userId: string | null = null): void {
+    this.db.prepare(
+      'INSERT OR IGNORE INTO monitor_authors (guild_id, username, user_id, active) VALUES (?, ?, ?, 1)'
+    ).run(guildId, username, userId);
+  }
+
+  removeMonitorAuthor(guildId: string, username: string): void {
+    this.db.prepare('DELETE FROM monitor_authors WHERE guild_id = ? AND username = ?').run(guildId, username);
+    this.db.prepare('DELETE FROM monitor_seen_tweets WHERE guild_id = ? AND username = ?').run(guildId, username);
+  }
+
+  removeAllMonitorAuthors(guildId: string): number {
+    const result = this.db.prepare('DELETE FROM monitor_authors WHERE guild_id = ?').run(guildId);
+    this.db.prepare('DELETE FROM monitor_seen_tweets WHERE guild_id = ?').run(guildId);
+    return result.changes;
+  }
+
+  updateMonitorAuthorCursor(guildId: string, username: string, lastTweetId: string, lastTweetTs: number): void {
+    this.db.prepare(`
+      UPDATE monitor_authors SET last_tweet_id = ?, last_tweet_ts = ? WHERE guild_id = ? AND username = ?
+    `).run(lastTweetId, lastTweetTs, guildId, username);
+  }
+
+  updateMonitorAuthorUserId(guildId: string, username: string, userId: string): void {
+    this.db.prepare('UPDATE monitor_authors SET user_id = ? WHERE guild_id = ? AND username = ?').run(userId, guildId, username);
+  }
+
+  renameMonitorAuthor(guildId: string, oldUsername: string, newUsername: string): boolean {
+    try {
+      const result = this.db.prepare('UPDATE monitor_authors SET username = ? WHERE guild_id = ? AND username = ?')
+        .run(newUsername, guildId, oldUsername);
+      return result.changes > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  getMonitorConfig(guildId: string, key: string, fallback?: string): string | null {
+    const row = this.db.prepare('SELECT value FROM monitor_config WHERE guild_id = ? AND key = ?').get(guildId, key) as { value: string } | undefined;
+    return row ? row.value : (fallback ?? null);
+  }
+
+  setMonitorConfig(guildId: string, key: string, value: string): void {
+    this.db.prepare(`
+      INSERT INTO monitor_config (guild_id, key, value) VALUES (?, ?, ?)
+      ON CONFLICT(guild_id, key) DO UPDATE SET value = excluded.value
+    `).run(guildId, key, value);
   }
 
   close(): void {

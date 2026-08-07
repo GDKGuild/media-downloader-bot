@@ -6,9 +6,12 @@ import { DatabaseService } from './services/databaseService';
 import { MegaService } from './services/megaService';
 import { DeferredDownloadQueue } from './services/deferredDownloadQueue';
 import { StorageService } from './services/storageService';
+import { TweetMonitorService } from './services/tweetMonitorService';
 import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
+import { execute as monitorCommandExecute } from './commands/monitor';
+import { handleVerifySelect, MONITOR_VERIFY_SELECT_ID } from './commands/monitor';
 import { handleMessageCreate } from './events/messageCreate';
 import { ActivityTracker } from './services/activityTracker';
 import { ActivityConfig } from './types/activity';
@@ -22,14 +25,30 @@ const defaultMediaConfig: MediaConfig = {
 
 let activityTracker: ActivityTracker;
 let currentStorageService: StorageService | undefined;
+let tweetMonitor: TweetMonitorService | undefined;
 
 export function getActivityTracker(): ActivityTracker {
   return activityTracker;
 }
 
+export function getTweetMonitorService(): TweetMonitorService | undefined {
+  return tweetMonitor;
+}
+
 export function disposeBot(): void {
   currentStorageService?.stopPolling();
   currentStorageService = undefined;
+  tweetMonitor?.stop();
+  tweetMonitor = undefined;
+}
+
+function logInteractionError(commandName: string, error: unknown): void {
+  const err = error as { code?: number } | undefined;
+  if (err && typeof err === 'object' && err.code === 10062) {
+    console.log(`[Commands] /${commandName}: interaction expired or already handled (10062) — ignored`);
+    return;
+  }
+  console.error(`[Commands] /${commandName}:`, error);
 }
 
 export function createBot(): Client {
@@ -78,6 +97,8 @@ export function createBot(): Client {
     }
   }, DOWNLOAD_DIR, DOWNLOAD_RETRIES, megaService, deferredQueue, storageService);
 
+  tweetMonitor = new TweetMonitorService(client, db, downloadService);
+
   const activityConfig: ActivityConfig = {
     advancedMode: process.env.ADVANCED_TRACKING === 'true',
     sessionIdleMs: parseInt(process.env.SESSION_IDLE_MINUTES || '5', 10) * 60_000,
@@ -122,9 +143,21 @@ export function createBot(): Client {
     }
     console.log(`[Activity] Tracking mode: ${activityConfig.advancedMode ? 'Advanced' : 'Simple'}`);
     activityTracker.startFlushInterval();
+    if (process.env.MONITOR_ENABLED !== 'false') {
+      tweetMonitor?.start();
+    }
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isStringSelectMenu() && interaction.customId === MONITOR_VERIFY_SELECT_ID) {
+      try {
+        await handleVerifySelect(interaction, db, tweetMonitor);
+      } catch (error) {
+        logInteractionError('monitor verify select', error);
+      }
+      return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     const ownerIds = (process.env.BOT_OWNER_ID ?? '').split(',').map((id) => id.trim()).filter(Boolean);
@@ -143,19 +176,27 @@ export function createBot(): Client {
           db
         );
       } catch (error) {
-        console.error('Unhandled interaction error:', error);
+        logInteractionError('download', error);
       }
     } else if (interaction.commandName === 'cancel') {
       try {
         await cancelCommandExecute(interaction);
       } catch (error) {
-        console.error('Unhandled interaction error:', error);
+        logInteractionError('cancel', error);
+      }
+    } else if (interaction.commandName === 'monitor') {
+      try {
+        await monitorCommandExecute(interaction, db, tweetMonitor);
+      } catch (error) {
+        logInteractionError('monitor', error);
       }
     }
   });
 
   client.on(Events.MessageCreate, async (message) => {
     activityTracker.track(message);
+    const consumed = tweetMonitor ? await tweetMonitor.handleAwaitMessage(message) : false;
+    if (consumed) return;
     await handleMessageCreate(message, downloadService, defaultMediaConfig);
   });
 
