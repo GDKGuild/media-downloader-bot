@@ -24,6 +24,8 @@ const rest = new REST({ version: '10' }).setToken(token);
     console.log('Registering slash commands...');
 
     if (guildIds.length > 0) {
+      await rest.put(Routes.applicationCommands(clientId), { body: [] });
+      console.log('Cleared global commands');
       for (const guildId of guildIds) {
         await rest.put(
           Routes.applicationGuildCommands(clientId, guildId),
@@ -37,6 +39,15 @@ const rest = new REST({ version: '10' }).setToken(token);
         { body: commands }
       );
       console.log(`Registered ${commands.length} global commands`);
+
+      const guilds = (await rest.get(Routes.userGuilds())) as { id: string }[];
+      for (const guild of guilds) {
+        const existing = (await rest.get(Routes.applicationGuildCommands(clientId, guild.id))) as unknown[];
+        if (existing.length > 0) {
+          await rest.put(Routes.applicationGuildCommands(clientId, guild.id), { body: [] });
+          console.log(`Cleared stale guild commands in ${guild.id}`);
+        }
+      }
     }
   } catch (error) {
     console.error('Failed to register commands:', error);
