@@ -8,19 +8,19 @@ export const data = new SlashCommandBuilder()
     option.setName('message-id')
       .setDescription('ID of the message to delete')
       .setRequired(true))
-  .addChannelOption(option =>
-    option.setName('channel')
-      .setDescription('Channel where the message lives (defaults to current)')
+  .addStringOption(option =>
+    option.setName('channel-id')
+      .setDescription('ID of the channel where the message lives (defaults to current channel; works across servers)')
       .setRequired(false));
 
 export async function execute(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const messageId = interaction.options.getString('message-id', true);
-  const targetId = interaction.options.getChannel('channel')?.id ?? interaction.channelId;
+  const targetId = interaction.options.getString('channel-id') ?? interaction.channelId;
   const channel = await interaction.client.channels.fetch(targetId).catch(() => null);
   if (!channel || !channel.isTextBased()) {
-    await safeEditReply(interaction, 'The target is not a text channel.');
+    await safeEditReply(interaction, 'The target is not a text channel the bot can see.');
     return;
   }
 
