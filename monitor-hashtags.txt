@@ -1,0 +1,5 @@
+# One hashtag per line. '#' optional, case-insensitive.
+# Lines starting with '# ' (hash + space) are comments.
+# Edit this file any time — the bot picks it up on the next poll.
+# gamedev
+# indiedev

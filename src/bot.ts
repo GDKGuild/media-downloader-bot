@@ -11,7 +11,7 @@ import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
 import { execute as monitorCommandExecute } from './commands/monitor';
-import { handleVerifySelect, MONITOR_VERIFY_SELECT_ID } from './commands/monitor';
+import { handleVerifySelect, handleConfigSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID } from './commands/monitor';
 import { handleMessageCreate } from './events/messageCreate';
 import { ActivityTracker } from './services/activityTracker';
 import { ActivityConfig } from './types/activity';
@@ -154,6 +154,15 @@ export function createBot(): Client {
         await handleVerifySelect(interaction, db, tweetMonitor);
       } catch (error) {
         logInteractionError('monitor verify select', error);
+      }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith(MONITOR_CONFIG_SELECT_ID)) {
+      try {
+        await handleConfigSelect(interaction, db);
+      } catch (error) {
+        logInteractionError('monitor config select', error);
       }
       return;
     }

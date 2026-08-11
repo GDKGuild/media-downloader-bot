@@ -6,11 +6,62 @@ import {
   ActionRowBuilder,
   MessageFlags,
 } from 'discord.js';
-import { DatabaseService } from '../services/databaseService';
+import { DatabaseService, MonitorAuthorRow } from '../services/databaseService';
 import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS } from '../services/tweetMonitorService';
 import { safeEditReply } from '../utils/interactionUtils';
 
 export const MONITOR_VERIFY_SELECT_ID = 'monitor_verify_select';
+export const MONITOR_CONFIG_SELECT_ID = 'monitor_config';
+
+const CONFIG_STEP_AUTHOR = `${MONITOR_CONFIG_SELECT_ID}:author`;
+const CONFIG_STEP_CONTENT = `${MONITOR_CONFIG_SELECT_ID}:content`;
+const CONFIG_STEP_MEDIA = `${MONITOR_CONFIG_SELECT_ID}:media`;
+const CONFIG_STEP_HASHTAG = `${MONITOR_CONFIG_SELECT_ID}:hashtag`;
+
+const CONTENT_OPTIONS = [
+  { label: 'Posts + reposts', value: '101', description: 'Default — posts and reposts, no replies' },
+  { label: 'Posts only', value: '100', description: 'Own posts, no replies, no reposts' },
+  { label: 'Replies only', value: '010', description: 'Only replies' },
+  { label: 'Posts + replies', value: '110', description: 'Posts and replies, no reposts' },
+  { label: 'Reposts only', value: '001', description: 'Only reposts' },
+  { label: 'Everything', value: '111', description: 'Posts, replies, and reposts' },
+];
+
+const MEDIA_OPTIONS = [
+  { label: 'Media only', value: '1', description: 'Default — only posts with media' },
+  { label: 'Text + media', value: '0', description: 'Relay text posts too' },
+];
+
+const HASHTAG_OPTIONS = [
+  { label: 'Off', value: '0', description: 'Default — no hashtag filter' },
+  { label: 'On', value: '1', description: 'Only relay posts matching monitor-hashtags.txt' },
+];
+
+function parseFlags(flags: string): { include_posts: number; include_replies: number; include_reposts: number } {
+  const [p, r, s] = flags.split('').map((c) => (c === '1' ? 1 : 0));
+  return { include_posts: p, include_replies: r, include_reposts: s };
+}
+
+function configSummary(a: MonitorAuthorRow): string {
+  const content = [
+    a.include_posts ? 'posts' : null,
+    a.include_replies ? 'replies' : null,
+    a.include_reposts ? 'reposts' : null,
+  ].filter(Boolean).join('+');
+  return `${content} · ${a.media_only ? 'media only' : 'text+media'}${a.hashtag_filter ? ' · #filter' : ''}`;
+}
+
+function makeSelectRow(
+  customId: string,
+  placeholder: string,
+  options: { label: string; value: string; description?: string }[],
+): ActionRowBuilder<StringSelectMenuBuilder> {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(customId)
+    .setPlaceholder(placeholder)
+    .addOptions(options);
+  return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
+}
 
 export const data = new SlashCommandBuilder()
   .setName('monitor')
@@ -56,6 +107,9 @@ export const data = new SlashCommandBuilder()
         opt.setName('minutes')
           .setDescription('Poll interval (1–1440)')
           .setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('config')
+      .setDescription('Configure per-author monitoring (content, media, hashtag filter)'))
   .addSubcommand(sub =>
     sub.setName('verify')
       .setDescription('Fetch a tracked author\'s latest post and send its link to the monitor channel as a test'))
@@ -111,6 +165,9 @@ export async function execute(
       break;
     case 'verify-all':
       await handleVerifyAll(interaction, db, monitor, guildId);
+      break;
+    case 'config':
+      await handleConfig(interaction, db, guildId);
       break;
     case 'await':
       await handleAwait(interaction, monitor, guildId);
@@ -272,6 +329,91 @@ export async function handleVerifySelect(
   }
 }
 
+async function handleConfig(interaction: ChatInputCommandInteraction, db: DatabaseService, guildId: string): Promise<void> {
+  const authors = db.listMonitorAuthors(guildId);
+  if (authors.length === 0) {
+    await safeEditReply(interaction, 'No authors are being monitored in this server yet. Use `/monitor add <username>` first.');
+    return;
+  }
+  const options = authors.slice(0, 25).map((a, i) => ({
+    label: `${i + 1}. @${a.username}`,
+    value: a.username,
+    description: configSummary(a),
+  }));
+  const row = makeSelectRow(CONFIG_STEP_AUTHOR, 'Choose an author to configure', options);
+  await interaction.editReply({
+    content: `**Configure — pick an author (${options.length} tracked):**`,
+    components: [row],
+  });
+}
+
+export async function handleConfigSelect(interaction: StringSelectMenuInteraction, db: DatabaseService): Promise<void> {
+  const guildId = interaction.guildId;
+  const parts = interaction.customId.split(':');
+  const step = parts[1];
+  const value = interaction.values[0];
+  if (!guildId || !step || !value) return;
+
+  try {
+    await interaction.deferUpdate();
+    const render = (content: string, row: ActionRowBuilder<StringSelectMenuBuilder>): Promise<unknown> =>
+      interaction.editReply({ content, components: [row] });
+
+    switch (step) {
+      case 'author': {
+        const username = value;
+        await render(
+          `**@${username} — what to include?**`,
+          makeSelectRow(`${CONFIG_STEP_CONTENT}:${username}`, 'Choose content types', CONTENT_OPTIONS),
+        );
+        break;
+      }
+      case 'content': {
+        const username = parts[2];
+        if (!username) return;
+        await render(
+          `**@${username} — media or text?**`,
+          makeSelectRow(`${CONFIG_STEP_MEDIA}:${username}:${value}`, 'Media only?', MEDIA_OPTIONS),
+        );
+        break;
+      }
+      case 'media': {
+        const username = parts[2];
+        const flags = parts[3];
+        if (!username || !flags) return;
+        await render(
+          `**@${username} — hashtag filter?**`,
+          makeSelectRow(`${CONFIG_STEP_HASHTAG}:${username}:${flags}:${value}`, 'Hashtag filter', HASHTAG_OPTIONS),
+        );
+        break;
+      }
+      case 'hashtag': {
+        const username = parts[2];
+        const flags = parts[3];
+        if (!username || !flags) return;
+        db.updateMonitorAuthorConfig(guildId, username, {
+          ...parseFlags(flags),
+          media_only: Number(parts[4]),
+          hashtag_filter: Number(value),
+        });
+        const author = db.getMonitorAuthor(guildId, username);
+        await interaction.editReply({
+          content: `**@${username} config updated** — ${author ? configSummary(author) : ''}`,
+          components: [],
+        });
+        break;
+      }
+    }
+  } catch (err) {
+    const e = err as { code?: number } | undefined;
+    if (e && typeof e === 'object' && e.code === 10062) {
+      console.log('[Monitor] config select: interaction expired or already handled (10062) — ignored');
+    } else {
+      console.error(`[Monitor] config select failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
 async function handleVerifyAll(
   interaction: ChatInputCommandInteraction,
   db: DatabaseService,
@@ -325,7 +467,8 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
   }
 
   const lines = authors.map((a) =>
-    `\`${a.user_id ?? '?'}\` - \`@${a.username}\` — ${a.last_tweet_id ? `last tweet \`${a.last_tweet_id}\`` : 'not yet baselined'}`);
+    `\`${a.user_id ?? '?'}\` - \`@${a.username}\` — ${configSummary(a)}` +
+    (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
   await safeEditReply(interaction,
     `**Monitored authors in this server (${authors.length})**\n` +
     lines.join('\n') +

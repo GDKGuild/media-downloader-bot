@@ -1,5 +1,7 @@
 import { Client, TextChannel, Message } from 'discord.js';
 import axios from 'axios';
+import { readFileSync } from 'fs';
+import * as path from 'path';
 import { DatabaseService, MonitorAuthorRow } from './databaseService';
 
 const API_BASE = 'https://api.fxtwitter.com/2/profile';
@@ -17,6 +19,8 @@ export interface MonitorTweet {
   type?: string;
   id: string | number;
   url: string;
+  text?: string;
+  raw_text?: { text?: string; facets?: { type?: string; original?: string }[] };
   created_timestamp?: number;
   media?: { all?: MonitorTweetMedia[] };
   author?: { id?: string; screen_name?: string };
@@ -67,27 +71,81 @@ export function hasMedia(tweet: MonitorTweet): boolean {
   return !!all && all.length > 0;
 }
 
-export async function replyParentHasMedia(tweet: MonitorTweet): Promise<boolean> {
+export async function fetchParent(tweet: MonitorTweet): Promise<MonitorTweet | null> {
   const parentId = tweet.replying_to?.status;
-  if (!parentId) return false;
+  if (!parentId) return null;
   try {
     const res = await axios.get(`${API_STATUS}/${encodeURIComponent(String(parentId))}`, {
       timeout: 15000,
       headers: { 'User-Agent': BROWSER_UA, 'Accept': 'application/json' },
       validateStatus: (s) => s === 200 || s === 404,
     });
-    if (res.status !== 200) return false;
+    if (res.status !== 200) return null;
     const data = res.data as { status?: MonitorTweet } | undefined;
-    return hasMedia(data?.status as MonitorTweet);
+    return data?.status ?? null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export async function replyParentHasMedia(tweet: MonitorTweet): Promise<boolean> {
+  const parent = await fetchParent(tweet);
+  return !!parent && hasMedia(parent);
 }
 
 export async function isIncludeable(tweet: MonitorTweet): Promise<boolean> {
   if (hasMedia(tweet)) return true;
   if (tweet.replying_to?.status) return await replyParentHasMedia(tweet);
   return false;
+}
+
+export type MonitorTweetKind = 'post' | 'reply' | 'repost';
+
+export function tweetKind(tweet: MonitorTweet): MonitorTweetKind {
+  if (tweet.reposted_by) return 'repost';
+  if (tweet.replying_to) return 'reply';
+  return 'post';
+}
+
+function tweetText(tweet: MonitorTweet): string {
+  return tweet.raw_text?.text ?? tweet.text ?? '';
+}
+
+function extractHashtags(text: string): string[] {
+  const matches = text.match(/#[\w]+/gi);
+  if (!matches) return [];
+  return matches.map((m) => m.slice(1).toLowerCase());
+}
+
+function hasConfiguredHashtag(tweet: MonitorTweet, hashtags: string[]): boolean {
+  const tweetTags = extractHashtags(tweetText(tweet));
+  return hashtags.some((t) => tweetTags.includes(t));
+}
+
+export function parseHashtagFile(content: string): string[] {
+  const tags: string[] = [];
+  for (const raw of content.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line === '#' || line.startsWith('# ')) continue;
+    tags.push(line.replace(/^#/, '').toLowerCase());
+  }
+  return tags;
+}
+
+function getMonitorPageSize(): number {
+  const n = parseInt(process.env.MONITOR_PAGE_SIZE || '', 10);
+  return Number.isFinite(n) && n >= 1 && n <= 200 ? n : 100;
+}
+
+function getMaxCatchup(): number {
+  const n = parseInt(process.env.MONITOR_MAX_CATCHUP || '', 10);
+  return Number.isFinite(n) && n >= 1 && n <= 500 ? n : 25;
+}
+
+function getHashtagFile(): string {
+  const file = process.env.MONITOR_HASHTAG_FILE || 'monitor-hashtags.txt';
+  return path.isAbsolute(file) ? file : path.resolve(process.cwd(), file);
 }
 
 export function tweetIdentity(tweet: MonitorTweet): { id: string | null; screen_name: string | null } {
@@ -386,8 +444,46 @@ export class TweetMonitorService {
     }
   }
 
-  private async fetchStatuses(username: string): Promise<MonitorTweet[]> {
+  private loadHashtags(): string[] {
+    try {
+      return parseHashtagFile(readFileSync(getHashtagFile(), 'utf8'));
+    } catch {
+      return [];
+    }
+  }
+
+  private async tweetPassesFilter(tweet: MonitorTweet, author: MonitorAuthorRow, hashtags: string[]): Promise<boolean> {
+    const kind = tweetKind(tweet);
+    const allowed = kind === 'post' ? author.include_posts : kind === 'reply' ? author.include_replies : author.include_reposts;
+    if (!allowed) return false;
+
+    if (hasMedia(tweet)) {
+      return hashtags.length === 0 || hasConfiguredHashtag(tweet, hashtags);
+    }
+
+    if (!author.media_only) {
+      if (hashtags.length === 0) return true;
+      if (hasConfiguredHashtag(tweet, hashtags)) return true;
+      if (kind === 'reply') {
+        const parent = await fetchParent(tweet);
+        return !!parent && hasConfiguredHashtag(parent, hashtags);
+      }
+      return false;
+    }
+
+    if (kind !== 'reply' || !tweet.replying_to?.status) return false;
+    const parent = await fetchParent(tweet);
+    if (!parent || !hasMedia(parent)) return false;
+    return hashtags.length === 0 || hasConfiguredHashtag(tweet, hashtags) || hasConfiguredHashtag(parent, hashtags);
+  }
+
+  private async fetchStatuses(username: string, author: MonitorAuthorRow): Promise<MonitorTweet[]> {
+    const hashtags = this.loadHashtags();
     const res = await axios.get(`${API_BASE}/${encodeURIComponent(username)}/statuses`, {
+      params: {
+        count: getMonitorPageSize(),
+        ...(author.include_replies ? { with_replies: 1 } : {}),
+      },
       timeout: 20000,
       headers: { 'User-Agent': BROWSER_UA, 'Accept': 'application/json' },
       validateStatus: (s) => s === 200 || s === 204 || s === 404,
@@ -398,15 +494,15 @@ export class TweetMonitorService {
     if (!data || data.code !== 200 || !Array.isArray(data.results)) return [];
     const tweets = data.results.filter((r): r is MonitorTweet =>
       !!r && typeof r === 'object' && (r as MonitorTweet).type === 'status');
-    const includeable: MonitorTweet[] = [];
+    const passed: MonitorTweet[] = [];
     for (const tweet of tweets) {
-      if (await isIncludeable(tweet)) includeable.push(tweet);
+      if (await this.tweetPassesFilter(tweet, author, hashtags)) passed.push(tweet);
     }
-    return includeable;
+    return passed;
   }
 
   private async pollAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
-    const tweets = await this.fetchStatuses(author.username);
+    const tweets = await this.fetchStatuses(author.username, author);
     if (tweets.length === 0) return;
 
     const newest = tweets[0];
@@ -437,19 +533,33 @@ export class TweetMonitorService {
       }
     }
 
-    if (author.last_tweet_id === newestId) return;
+    if (author.last_tweet_id == null) {
+      this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
+      console.log(`[Monitor] @${author.username}: baselined at ${newestId} (no relay on first poll)`);
+      return;
+    }
 
-    let posted = false;
-    if (channelId) {
+    const cursorIdx = tweets.findIndex((t) => String(t.id) === author.last_tweet_id);
+    const newTweets = cursorIdx !== -1
+      ? tweets.slice(0, cursorIdx)
+      : author.last_tweet_ts != null
+        ? tweets.filter((t) => (t.created_timestamp ?? 0) > author.last_tweet_ts!)
+        : tweets;
+
+    let relayed = 0;
+    const maxCatchup = getMaxCatchup();
+    for (const tweet of newTweets) {
+      if (relayed >= maxCatchup) break; // ponytail: hard cap; overflow only lost on bursts > cap between polls
+      if (!channelId) continue;
       try {
-        await this.relayTweet(newest, author.username, channelId, guildId);
-        posted = true;
+        await this.relayTweet(tweet, author.username, channelId, guildId);
+        relayed++;
       } catch (err) {
-        console.error(`[Monitor] Relay @${author.username}/${newestId} failed: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`[Monitor] Relay @${author.username}/${tweet.id} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
-    console.log(`[Monitor] @${author.username}: ${posted ? 'relayed' : 'tracked'} newest post ${newestId}`);
+    console.log(`[Monitor] @${author.username}: ${relayed} new post(s) relayed, cursor at ${newestId}`);
   }
 
   private async relayTweet(tweet: MonitorTweet, username: string, channelId: string, guildId: string): Promise<void> {
