@@ -1,4 +1,4 @@
-import { Client, TextChannel, Message } from 'discord.js';
+import { Client, TextChannel, Message, ChatInputCommandInteraction } from 'discord.js';
 import axios from 'axios';
 import { readFileSync } from 'fs';
 import * as path from 'path';
@@ -222,14 +222,20 @@ export class TweetMonitorService {
   private db: DatabaseService;
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
-  private pendingAwait = new Map<string, { expiresAt: number; channelId: string; requesterId: string; timer: NodeJS.Timeout }>();
+  private pendingAwait = new Map<string, {
+    expiresAt: number;
+    channelId: string;
+    requesterId: string;
+    timer: NodeJS.Timeout;
+    interaction?: ChatInputCommandInteraction;
+  }>();
 
   constructor(client: Client, db: DatabaseService) {
     this.client = client;
     this.db = db;
   }
 
-  armAwait(guildId: string, channelId: string, requesterId: string, minutes: number): void {
+  armAwait(guildId: string, channelId: string, requesterId: string, minutes: number, interaction?: ChatInputCommandInteraction): void {
     this.cancelAwait(guildId);
     const ms = minutes * 60_000;
     const timer = setTimeout(() => {
@@ -241,7 +247,7 @@ export class TweetMonitorService {
         }
       }).catch(() => {});
     }, ms);
-    this.pendingAwait.set(guildId, { expiresAt: Date.now() + ms, channelId, requesterId, timer });
+    this.pendingAwait.set(guildId, { expiresAt: Date.now() + ms, channelId, requesterId, timer, interaction });
   }
 
   cancelAwait(guildId: string): boolean {
@@ -271,7 +277,7 @@ export class TweetMonitorService {
     try {
       const author = await resolveTweetAuthor(tweetId);
       if (!author) {
-        await this.safeAwaitReply(message, `Could not resolve tweet \`${tweetId}\` — the link may be invalid or the post was deleted. Run \`/monitor await\` to try again.`);
+        await this.confirmAwait(pending, message, `Could not resolve tweet \`${tweetId}\` — the link may be invalid or the post was deleted. Run \`/monitor await\` to try again.`);
         return true;
       }
       const existingById = author.userId ? this.db.findMonitorAuthorByUserId(guildId, author.userId) : null;
@@ -279,11 +285,11 @@ export class TweetMonitorService {
       const existing = existingById ?? existingByCI;
       if (existing) {
         this.db.updateMonitorAuthorUserId(guildId, existing.username, author.userId);
-        await this.safeAwaitReply(message, `@${existing.username} is already being monitored in this server.`);
+        await this.confirmAwait(pending, message, `@${existing.username} is already being monitored in this server.`);
         return true;
       }
       this.db.addMonitorAuthor(guildId, author.screen_name, author.userId);
-      await this.safeAwaitReply(message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed after that.`);
+      await this.confirmAwait(pending, message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed after that.`);
     } catch (err) {
       console.error(`[Monitor] Await resolution failed: ${err instanceof Error ? err.message : String(err)}`);
       await this.safeAwaitReply(message, 'Something went wrong resolving that tweet. Please try again.');
@@ -297,6 +303,22 @@ export class TweetMonitorService {
     } catch {
       // channel may be gone or bot lacks permission
     }
+  }
+
+  private async confirmAwait(
+    pending: { interaction?: ChatInputCommandInteraction } | undefined,
+    message: Message,
+    content: string,
+  ): Promise<void> {
+    if (pending?.interaction) {
+      try {
+        await pending.interaction.editReply(content);
+        return;
+      } catch {
+        // deferred reply token likely expired — fall back to a normal message reply
+      }
+    }
+    await this.safeAwaitReply(message, content);
   }
 
   getChannelId(guildId: string): string | null {

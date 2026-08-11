@@ -10,6 +10,7 @@ import { TweetMonitorService } from './services/tweetMonitorService';
 import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
+import { execute as deleteCommandExecute } from './commands/delete';
 import { execute as monitorCommandExecute } from './commands/monitor';
 import { handleVerifySelect, handleConfigSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID } from './commands/monitor';
 import { handleMessageCreate } from './events/messageCreate';
@@ -192,6 +193,12 @@ export function createBot(): Client {
         await cancelCommandExecute(interaction);
       } catch (error) {
         logInteractionError('cancel', error);
+      }
+    } else if (interaction.commandName === 'delete') {
+      try {
+        await deleteCommandExecute(interaction);
+      } catch (error) {
+        logInteractionError('delete', error);
       }
     } else if (interaction.commandName === 'monitor') {
       try {

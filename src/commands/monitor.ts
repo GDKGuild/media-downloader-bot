@@ -216,7 +216,7 @@ async function handleAwait(interaction: ChatInputCommandInteraction, monitor: Tw
     await safeEditReply(interaction, 'Wait time must be between 1 and 30 minutes.');
     return;
   }
-  monitor.armAwait(guildId, interaction.channelId, interaction.user.id, minutes);
+  monitor.armAwait(guildId, interaction.channelId, interaction.user.id, minutes, interaction);
   await safeEditReply(interaction, `Waiting **${minutes} minute(s)** for a tweet link in this server. Paste any \`x.com\` / \`twitter.com\` / \`fxtwitter.com\` / \`fixupx.com\` / \`vxtwitter.com\` post link in any channel — I'll add its author to the monitor.`);
 }
 

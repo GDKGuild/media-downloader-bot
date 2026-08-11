@@ -3,6 +3,7 @@ import { config } from 'dotenv';
 import { data as downloadCommand } from './commands/download';
 import { data as cancelCommand } from './commands/cancel';
 import { data as monitorCommand } from './commands/monitor';
+import { data as deleteCommand } from './commands/delete';
 
 config();
 
@@ -15,7 +16,7 @@ if (!token || !clientId) {
   process.exit(1);
 }
 
-const commands = [downloadCommand.toJSON(), cancelCommand.toJSON(), monitorCommand.toJSON()];
+const commands = [downloadCommand.toJSON(), cancelCommand.toJSON(), monitorCommand.toJSON(), deleteCommand.toJSON()];
 
 const rest = new REST({ version: '10' }).setToken(token);
 
