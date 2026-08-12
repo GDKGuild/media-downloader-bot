@@ -446,8 +446,11 @@ async function handleVerifyAll(
       default: return `\`@${e.username}\` → failed`;
     }
   });
+  const header = result.aborted
+    ? `**Verify all aborted by /cancel** (${result.entries.length} author(s) processed before stop)`
+    : `**Verify all (${result.entries.length} tracked)**`;
   await safeEditReply(interaction,
-    `**Verify all (${result.entries.length} tracked)**\n` +
+    header + '\n' +
     lines.join('\n') +
     `\nChannel: <#${channelId}>`);
 }

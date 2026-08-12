@@ -1,5 +1,6 @@
 import { ChatInputCommandInteraction, SlashCommandBuilder, MessageFlags } from 'discord.js';
 import { setCancel, setGlobalCancel, resetGlobalCancel } from '../services/cancelManager';
+import { TweetMonitorService } from '../services/tweetMonitorService';
 import { safeEditReply } from '../utils/interactionUtils';
 
 export const data = new SlashCommandBuilder()
@@ -7,11 +8,12 @@ export const data = new SlashCommandBuilder()
   .setDescription('Cancel the current download in this channel')
   .addBooleanOption(option =>
     option.setName('all')
-      .setDescription('Cancel all active downloads (overrides channel-specific cancel)')
+      .setDescription('Cancel all active operations (downloads + monitor verify-all)')
       .setRequired(false));
 
 export async function execute(
   interaction: ChatInputCommandInteraction,
+  monitor?: TweetMonitorService,
 ): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -19,8 +21,9 @@ export async function execute(
 
   if (cancelAll) {
     setGlobalCancel();
-    console.log(`[Cancel] All downloads cancelled by ${interaction.user.tag}`);
-    await safeEditReply(interaction, 'All downloads cancelled. Any in-progress downloads will stop shortly.');
+    monitor?.cancelVerifyAll();
+    console.log(`[Cancel] All operations cancelled by ${interaction.user.tag}`);
+    await safeEditReply(interaction, 'All operations cancelled. In-progress downloads and `/monitor verify-all` will stop shortly.');
     return;
   }
 

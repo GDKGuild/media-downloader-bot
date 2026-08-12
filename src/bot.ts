@@ -190,7 +190,7 @@ export function createBot(): Client {
       }
     } else if (interaction.commandName === 'cancel') {
       try {
-        await cancelCommandExecute(interaction);
+        await cancelCommandExecute(interaction, tweetMonitor);
       } catch (error) {
         logInteractionError('cancel', error);
       }

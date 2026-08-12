@@ -38,6 +38,7 @@ export interface MonitorVerifyAllEntry {
 export interface MonitorVerifyAllResult {
   channelId: string | null;
   entries: MonitorVerifyAllEntry[];
+  aborted?: boolean;
 }
 
 export interface MonitorVerifyResult {
@@ -222,6 +223,7 @@ export class TweetMonitorService {
   private db: DatabaseService;
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
+  private verifyAllAborted = false;
   private pendingAwait = new Map<string, {
     expiresAt: number;
     channelId: string;
@@ -363,6 +365,10 @@ export class TweetMonitorService {
     this.db.setMonitorConfig(guildId, 'fixer_list', JSON.stringify(list));
   }
 
+  cancelVerifyAll(): void {
+    this.verifyAllAborted = true;
+  }
+
   async verify(author: MonitorAuthorRow, guildId: string): Promise<MonitorVerifyResult> {
     const tweet = await fetchLatestTweet(author.username);
     if (!tweet) return { found: false, tweetId: null, channelId: null, posted: false };
@@ -390,8 +396,12 @@ export class TweetMonitorService {
     const channelId = this.getChannelId(guildId);
     const authors = this.db.listMonitorAuthors(guildId);
     const entries: MonitorVerifyAllEntry[] = [];
+    this.verifyAllAborted = false;
 
     for (const author of authors) {
+      if (this.verifyAllAborted) {
+        return { channelId, entries, aborted: true };
+      }
       const entry: MonitorVerifyAllEntry = { username: author.username, status: 'no-posts', tweetId: null };
       try {
         const tweet = await fetchLatestTweet(author.username);
