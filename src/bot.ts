@@ -14,8 +14,6 @@ import { execute as deleteCommandExecute } from './commands/delete';
 import { execute as monitorCommandExecute } from './commands/monitor';
 import { handleVerifySelect, handleConfigSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID } from './commands/monitor';
 import { handleMessageCreate } from './events/messageCreate';
-import { ActivityTracker } from './services/activityTracker';
-import { ActivityConfig } from './types/activity';
 
 const defaultMediaConfig: MediaConfig = {
   images: true,
@@ -24,13 +22,8 @@ const defaultMediaConfig: MediaConfig = {
   other: true,
 };
 
-let activityTracker: ActivityTracker;
 let currentStorageService: StorageService | undefined;
 let tweetMonitor: TweetMonitorService | undefined;
-
-export function getActivityTracker(): ActivityTracker {
-  return activityTracker;
-}
 
 export function getTweetMonitorService(): TweetMonitorService | undefined {
   return tweetMonitor;
@@ -100,12 +93,6 @@ export function createBot(): Client {
 
   tweetMonitor = new TweetMonitorService(client, db);
 
-  const activityConfig: ActivityConfig = {
-    advancedMode: process.env.ADVANCED_TRACKING === 'true',
-    sessionIdleMs: parseInt(process.env.SESSION_IDLE_MINUTES || '5', 10) * 60_000,
-  };
-  activityTracker = new ActivityTracker(activityConfig);
-
   if (megaService) {
     megaService.onConnect(() => {
       downloadService.processDeferredQueue(client).catch((err: unknown) => {
@@ -142,8 +129,6 @@ export function createBot(): Client {
     if (storageService) {
       console.log(`[Storage] External drive: ${storageService.getStorageLabel()}`);
     }
-    console.log(`[Activity] Tracking mode: ${activityConfig.advancedMode ? 'Advanced' : 'Simple'}`);
-    activityTracker.startFlushInterval();
     if (process.env.MONITOR_ENABLED !== 'false') {
       tweetMonitor?.start();
     }
@@ -210,7 +195,6 @@ export function createBot(): Client {
   });
 
   client.on(Events.MessageCreate, async (message) => {
-    activityTracker.track(message);
     const consumed = tweetMonitor ? await tweetMonitor.handleAwaitMessage(message) : false;
     if (consumed) return;
     await handleMessageCreate(message, downloadService, defaultMediaConfig);

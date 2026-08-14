@@ -1,6 +1,6 @@
 import { config } from 'dotenv';
 import { Client, Events } from 'discord.js';
-import { createBot, disposeBot, getActivityTracker } from './bot';
+import { createBot, disposeBot } from './bot';
 
 config();
 
@@ -115,9 +115,6 @@ function shutdown() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
-  const tracker = getActivityTracker();
-  tracker.flushAll();
-  tracker.stopFlushInterval();
   disposeBot();
   if (client) {
     try {
