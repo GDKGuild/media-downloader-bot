@@ -13,6 +13,7 @@ import { execute as cancelCommandExecute } from './commands/cancel';
 import { execute as deleteCommandExecute } from './commands/delete';
 import { execute as monitorCommandExecute } from './commands/monitor';
 import { handleVerifySelect, handleConfigSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID } from './commands/monitor';
+import { execute as helpCommandExecute, handleHelpButton, HELP_PAGE_PREFIX } from './commands/help';
 import { handleMessageCreate } from './events/messageCreate';
 
 const defaultMediaConfig: MediaConfig = {
@@ -135,6 +136,15 @@ export function createBot(): Client {
   });
 
   client.on(Events.InteractionCreate, async (interaction) => {
+    if (interaction.isButton() && interaction.customId.startsWith(HELP_PAGE_PREFIX)) {
+      try {
+        await handleHelpButton(interaction);
+      } catch (error) {
+        logInteractionError('help nav', error);
+      }
+      return;
+    }
+
     if (interaction.isStringSelectMenu() && interaction.customId === MONITOR_VERIFY_SELECT_ID) {
       try {
         await handleVerifySelect(interaction, db, tweetMonitor);
@@ -156,7 +166,7 @@ export function createBot(): Client {
     if (!interaction.isChatInputCommand()) return;
 
     const ownerIds = (process.env.BOT_OWNER_ID ?? '').split(',').map((id) => id.trim()).filter(Boolean);
-    if (ownerIds.length > 0 && !ownerIds.includes(interaction.user.id)) {
+    if (ownerIds.length > 0 && !ownerIds.includes(interaction.user.id) && interaction.commandName !== 'help') {
       await interaction.reply({ content: 'Only the bot owner can use this command.', flags: MessageFlags.Ephemeral });
       return;
     }
@@ -190,6 +200,12 @@ export function createBot(): Client {
         await monitorCommandExecute(interaction, db, tweetMonitor);
       } catch (error) {
         logInteractionError('monitor', error);
+      }
+    } else if (interaction.commandName === 'help') {
+      try {
+        await helpCommandExecute(interaction);
+      } catch (error) {
+        logInteractionError('help', error);
       }
     }
   });
