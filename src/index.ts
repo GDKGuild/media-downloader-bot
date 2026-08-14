@@ -43,6 +43,13 @@ function buildClient(): Client {
   client.on(Events.ShardError, (error) => {
     console.error(`[Connection] Shard error: ${error instanceof Error ? error.message : String(error)}`);
   });
+  client.on(Events.ShardDisconnect, (closeEvent, shardId) => {
+    console.error(`[Connection] Shard ${shardId} disconnected: ${closeEvent?.reason ?? closeEvent?.code ?? 'unknown'} — reconnecting`);
+    scheduleReconnect();
+  });
+  client.on(Events.ShardResume, (shardId) => {
+    console.log(`[Connection] Shard ${shardId} resumed`);
+  });
   client.on(Events.Error, (error) => {
     console.error(`[Connection] Client error: ${error instanceof Error ? error.message : String(error)}`);
   });
