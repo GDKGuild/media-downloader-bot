@@ -2,7 +2,6 @@ import { Message, TextChannel, NewsChannel, ThreadChannel, DMChannel, VoiceChann
 import { MediaDownloadService } from '../services/mediaDownloadService';
 import { MediaConfig } from '../types';
 import { extractMediaFromMessage } from '../utils/mediaUtils';
-import { SessionLogger } from '../utils/sessionLogger';
 
 const AUTO_DOWNLOAD = process.env.AUTO_DOWNLOAD !== 'false';
 
@@ -51,7 +50,6 @@ export async function handleMessageCreate(
     ? channel.parent?.name || channel.parentId || undefined
     : undefined;
 
-  const logger = new SessionLogger(guildName, channelName, 'auto');
   try {
     const guildId = message.guild?.id;
     const channelId = message.channel.id;
@@ -67,17 +65,14 @@ export async function handleMessageCreate(
       channelName,
       mediaConfig,
       parentChannelName,
-      logger,
       resolvedBaseDir,
     );
 
     if (count > 0) {
-      console.log(`[Auto] Downloaded ${count} file(s) from "${channelName}" by ${message.author.tag}`);
+      console.log(`[Auto] Downloaded ${count} file(s) from "${channelName}"`);
     }
-    logger.close(`${count} file(s) from ${message.author.tag}`);
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     console.error(`[Auto] Failed to download media from ${channelName}: ${msg}`);
-    logger.close(`Error: ${msg}`);
   }
 }

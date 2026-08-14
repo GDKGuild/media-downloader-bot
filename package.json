@@ -9,7 +9,6 @@
     "dev": "tsx watch src/index.ts",
     "register-commands": "tsx src/register-commands.ts",
     "sync-db": "tsx src/sync-db.ts",
-    "sweep": "tsx src/sweep-channels.ts",
     "migrate-mega": "tsx src/migrate-to-mega.ts",
     "migrate-drive": "tsx src/migrate-to-drive.ts"
   },
