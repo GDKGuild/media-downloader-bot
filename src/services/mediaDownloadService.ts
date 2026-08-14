@@ -338,9 +338,6 @@ export class MediaDownloadService {
 
     const baseDir = resolvedBaseDir || this.resolveBaseDir(guildName, channelName, parentChannelName);
 
-    const avatarResult = await this.downloadAvatars(messages, baseDir, megaBasePath, concurrency, guildId, channelId);
-    if (channelId && isCancelled(channelId)) return { mediaCount: 0, outputPath: baseDir, totalBytes: 0, megaBasePath };
-
     if (onStatus) onStatus('Downloading media files...');
     const mediaResult = await this.downloadAttachments(messages, baseDir, megaBasePath, mediaConfig, guildId, channelId, channelName, concurrency);
     if (channelId && isCancelled(channelId)) return { mediaCount: mediaResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes, megaBasePath };
@@ -357,7 +354,6 @@ export class MediaDownloadService {
       `Channel: ${channelName}`,
       `Messages scanned: ${messages.length}`,
       `Media files downloaded: ${mediaResult.count}`,
-      `Avatars downloaded: ${avatarResult.count}`,
       `Emojis downloaded: ${emojiResult.count}`,
       `Total files: ${stats.fileCount}`,
       `Total size: ${formatBytes(stats.totalSize)}`,
@@ -366,7 +362,7 @@ export class MediaDownloadService {
     ];
     this.fileService.writeSummary(baseDir, lines.join('\n'));
 
-    return { mediaCount: mediaResult.count + avatarResult.count + emojiResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes + avatarResult.bytes + emojiResult.bytes, megaBasePath };
+    return { mediaCount: mediaResult.count + emojiResult.count, outputPath: baseDir, totalBytes: mediaResult.bytes + emojiResult.bytes, megaBasePath };
   }
 
   async downloadMediaOnly(
@@ -525,69 +521,6 @@ export class MediaDownloadService {
     } catch {
       // non-critical; silently ignore
     }
-  }
-
-  private async downloadAvatars(
-    messages: Message[],
-    baseDir: string,
-    megaBasePath: string,
-    concurrency = 3,
-    guildId?: string,
-    channelId?: string,
-  ): Promise<{ count: number; bytes: number }> {
-    const avatarSet = new Set<string>();
-
-    for (const msg of messages) {
-      const author = msg.author;
-      if (author?.id && author.avatar) {
-        avatarSet.add(`${author.id}/${author.avatar}`);
-      }
-    }
-
-    const avatars = Array.from(avatarSet);
-    this.onProgress({
-      stage: 'avatars',
-      current: 0,
-      total: avatars.length,
-      message: `Downloading ${avatars.length} avatars...`,
-    });
-
-    let downloaded = 0;
-    let totalBytes = 0;
-
-    for (let i = 0; i < avatars.length; i += concurrency) {
-      const batch = avatars.slice(i, i + concurrency);
-      const results = await Promise.allSettled(
-        batch.map(async (idAndAvatar) => {
-          const [userId, avatarHash] = idAndAvatar.split('/');
-          const url = `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.webp?size=80`;
-
-          const avatarDir = this.fileService.getAvatarDir(baseDir);
-          const userDir = path.join(avatarDir, userId);
-
-          const result = await this.tryDownload(
-            url, null, userDir, avatarHash, 'images', 'webp', guildId, channelId, undefined,
-            'avatar',
-          );
-          return result;
-        })
-      );
-
-      for (const r of results) {
-        if (r.status === 'fulfilled' && r.value.status === 'downloaded') {
-          downloaded++;
-          totalBytes += r.value.bytes;
-        }
-        this.onProgress({
-          stage: 'avatars',
-          current: downloaded,
-          total: avatars.length,
-          message: `Downloaded avatar ${downloaded}/${avatars.length}`,
-        });
-      }
-    }
-
-    return { count: downloaded, bytes: totalBytes };
   }
 
   private async supplementEmbedScrapes(

@@ -16,8 +16,8 @@ const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', '
 const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'mpeg', 'mpg']);
 const AUDIO_EXTS = new Set(['mp3', 'wav', 'ogg', 'oga', 'm4a', 'flac', 'aac', 'opus', 'wma']);
 
-const CATEGORY_DIRS = new Set(['images', 'videos', 'audio', 'other', 'avatars', 'emojis']);
-const STRUCTURAL_DIRS = new Set(['images', 'videos', 'audio', 'other', 'avatars', 'emojis', 'media']);
+const CATEGORY_DIRS = new Set(['images', 'videos', 'audio', 'other', 'emojis']);
+const STRUCTURAL_DIRS = new Set(['images', 'videos', 'audio', 'other', 'emojis', 'media']);
 const META_FILES = new Set(['_meta.json', '_summary.txt', '_summary (1).txt', 'desktop.ini', 'Thumbs.db']);
 
 interface FileEntry {

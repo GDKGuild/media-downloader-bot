@@ -38,12 +38,6 @@ export class FileService {
     return dir;
   }
 
-  getAvatarDir(baseDir: string): string {
-    const dir = path.join(baseDir, 'avatars');
-    this.ensureDir(dir);
-    return dir;
-  }
-
   getEmojiDir(baseDir: string): string {
     const dir = path.join(baseDir, 'emojis');
     this.ensureDir(dir);

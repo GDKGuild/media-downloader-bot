@@ -11,7 +11,7 @@ export interface ChannelState {
   parent_channel_name: string | null;
 }
 
-export type FileType = 'media' | 'avatar' | 'emoji';
+export type FileType = 'media' | 'emoji';
 
 export interface FileHashRow {
   hash: string;
@@ -71,7 +71,7 @@ export class DatabaseService {
         hash TEXT NOT NULL,
         guild_id TEXT NOT NULL,
         channel_id TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('media', 'avatar', 'emoji')),
+        type TEXT NOT NULL CHECK(type IN ('media', 'emoji')),
         url TEXT,
         filename TEXT NOT NULL,
         file_size INTEGER DEFAULT 0,
