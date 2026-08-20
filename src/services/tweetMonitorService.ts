@@ -458,6 +458,10 @@ export class TweetMonitorService {
   }
 
   private isNetworkError(err: unknown): boolean {
+    if (err && typeof err === 'object') {
+      const code = (err as { code?: string }).code;
+      if (code && /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED/i.test(code)) return true;
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|network|socket|timeout/i.test(msg);
   }
@@ -465,33 +469,31 @@ export class TweetMonitorService {
   private async poll(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
-    let networkErrors = 0;
+    let networkError = false;
     try {
       for (const guildId of this.db.listMonitorGuilds()) {
         const channelId = this.getChannelId(guildId);
         for (const author of this.db.listMonitorAuthors(guildId)) {
           try {
             await this.pollAuthor(author, guildId, channelId);
-            networkErrors = 0;
           } catch (err) {
-            console.error(`[Monitor] Poll @${author.username} failed: ${err instanceof Error ? err.message : String(err)}`);
             if (this.isNetworkError(err)) {
-              networkErrors++;
-              if (networkErrors >= 3) {
-                console.log('[Monitor] Network unreachable, pausing 60s');
-                break;
+              if (!networkError) {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.log(`[Monitor] Network error: ${detail || 'unknown'} — pausing 60s`);
               }
-            } else {
-              networkErrors = 0;
+              networkError = true;
+              break;
             }
+            console.error(`[Monitor] Poll @${author.username} failed: ${err instanceof Error ? err.message : String(err)}`);
           }
         }
-        if (networkErrors >= 3) break;
+        if (networkError) break;
       }
     } finally {
       this.polling = false;
     }
-    if (networkErrors >= 3) {
+    if (networkError) {
       setTimeout(() => { void this.poll(); }, 60_000);
     }
   }
