@@ -457,22 +457,42 @@ export class TweetMonitorService {
     this.start();
   }
 
+  private isNetworkError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|network|socket|timeout/i.test(msg);
+  }
+
   private async poll(): Promise<void> {
     if (this.polling) return;
     this.polling = true;
+    let networkErrors = 0;
     try {
       for (const guildId of this.db.listMonitorGuilds()) {
         const channelId = this.getChannelId(guildId);
         for (const author of this.db.listMonitorAuthors(guildId)) {
           try {
             await this.pollAuthor(author, guildId, channelId);
+            networkErrors = 0;
           } catch (err) {
             console.error(`[Monitor] Poll @${author.username} failed: ${err instanceof Error ? err.message : String(err)}`);
+            if (this.isNetworkError(err)) {
+              networkErrors++;
+              if (networkErrors >= 3) {
+                console.log('[Monitor] Network unreachable, pausing 60s');
+                break;
+              }
+            } else {
+              networkErrors = 0;
+            }
           }
         }
+        if (networkErrors >= 3) break;
       }
     } finally {
       this.polling = false;
+    }
+    if (networkErrors >= 3) {
+      setTimeout(() => { void this.poll(); }, 60_000);
     }
   }
 
