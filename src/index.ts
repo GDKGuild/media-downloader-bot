@@ -1,8 +1,20 @@
 import { config } from 'dotenv';
+import https from 'node:https';
 import { Client, Events } from 'discord.js';
 import { createBot, disposeBot } from './bot';
 
 config();
+
+if (process.env.PHYSICAL_NIC_IP) {
+  const ip = process.env.PHYSICAL_NIC_IP;
+  https.globalAgent = new https.Agent({ localAddress: ip, keepAlive: true });
+  import('undici').then(({ Agent: UndiciAgent, setGlobalDispatcher }) => {
+    setGlobalDispatcher(new UndiciAgent({ connect: { localAddress: ip } }));
+    console.log(`[Network] Bound to physical NIC: ${ip}`);
+  }).catch(() => {
+    console.log(`[Network] Bound HTTPS to ${ip} (undici not available, gateway may still use VPN adapter)`);
+  });
+}
 
 const token = process.env.DISCORD_TOKEN;
 
