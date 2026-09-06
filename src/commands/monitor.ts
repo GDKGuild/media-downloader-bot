@@ -5,6 +5,7 @@ import {
   StringSelectMenuInteraction,
   ActionRowBuilder,
   MessageFlags,
+  EmbedBuilder,
 } from 'discord.js';
 import { DatabaseService, MonitorAuthorRow } from '../services/databaseService';
 import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS } from '../services/tweetMonitorService';
@@ -461,22 +462,25 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
   const interval = monitor?.getIntervalMinutes(guildId) ?? 15;
   const fixers = monitor?.getFixers(guildId) ?? DEFAULT_FIXERS;
 
+  const footer =
+    `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${interval} min\n` +
+    `Fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`;
+
   if (authors.length === 0) {
     await safeEditReply(interaction,
-      `No authors being monitored in this server yet. Use \`/monitor add <username>\`.\n\n` +
-      `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${interval} min\n` +
-      `Fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`);
+      `No authors being monitored in this server yet. Use \`/monitor add <username>\`.\n\n${footer}`);
     return;
   }
 
   const lines = authors.map((a) =>
     `\`${a.user_id ?? '?'}\` - \`@${a.username}\` — ${configSummary(a)}` +
     (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
-  await safeEditReply(interaction,
-    `**Monitored authors in this server (${authors.length})**\n` +
-    lines.join('\n') +
-    `\n\nChannel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${interval} min\n` +
-    `Fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`);
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`Monitored authors in this server (${authors.length})`)
+    .setDescription(lines.join('\n'))
+    .setFooter({ text: footer });
+  await interaction.editReply({ embeds: [embed] });
 }
 
 async function handleChannel(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
