@@ -1,6 +1,6 @@
 import { Client, TextChannel, Message, ChatInputCommandInteraction } from 'discord.js';
 import axios from 'axios';
-import { readFileSync } from 'fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'fs';
 import * as path from 'path';
 import { DatabaseService, MonitorAuthorRow } from './databaseService';
 
@@ -9,6 +9,8 @@ const API_STATUS = 'https://api.fxtwitter.com/2/status';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 export const DEFAULT_FIXERS: string[] = ['fixupx.com', 'fixvx.com', 'fxtwitter.com', 'vxtwitter.com', 'cunnyx.com'];
+
+export type RepostScope = 'PER_GUILD' | 'PER_CHANNEL' | 'GLOBAL';
 
 export interface MonitorTweetMedia {
   url: string;
@@ -31,7 +33,7 @@ export interface MonitorTweet {
 
 export interface MonitorVerifyAllEntry {
   username: string;
-  status: 'posted' | 'skipped' | 'identity-mismatch' | 'no-posts' | 'failed' | 'no-channel';
+  status: 'posted' | 'skipped' | 'identity-mismatch' | 'no-posts' | 'failed' | 'no-channel' | 'duplicate';
   tweetId: string | null;
 }
 
@@ -46,7 +48,7 @@ export interface MonitorVerifyResult {
   tweetId: string | null;
   channelId: string | null;
   posted: boolean;
-  reason?: 'identity-mismatch';
+  reason?: 'identity-mismatch' | 'duplicate';
 }
 
 const TWEET_URL_RE = /\bhttps?:\/\/(?:www\.)?(?:x|twitter|fixupx|fixvx|fxtwitter|vxtwitter|cunnyx)\.com\/[^\s]*?\/status\/(\d+)/i;
@@ -352,6 +354,11 @@ export class TweetMonitorService {
     return [...DEFAULT_FIXERS];
   }
 
+  getRepostScope(): RepostScope {
+    const raw = (process.env.MONITOR_REPOST_SCOPE || '').trim().toUpperCase();
+    return raw === 'PER_GUILD' || raw === 'PER_CHANNEL' || raw === 'GLOBAL' ? raw : 'PER_CHANNEL';
+  }
+
   setChannel(guildId: string, channelId: string): void {
     this.db.setMonitorConfig(guildId, 'target_channel_id', channelId);
   }
@@ -384,7 +391,10 @@ export class TweetMonitorService {
     const channelId = this.getChannelId(guildId);
     if (!channelId) return { found: true, tweetId: String(tweet.id), channelId: null, posted: false };
     try {
-      await this.relayTweet(tweet, author.username, channelId, guildId);
+      const result = await this.relayTweet(tweet, author.username, channelId, guildId);
+      if (result.skipped) {
+        return { found: true, tweetId: String(tweet.id), channelId, posted: false, reason: 'duplicate' };
+      }
       return { found: true, tweetId: String(tweet.id), channelId, posted: true };
     } catch (err) {
       console.error(`[Monitor] Verify relay @${author.username}/${tweet.id} failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -419,9 +429,9 @@ export class TweetMonitorService {
             if (!author.user_id && tweetAuthorId) {
               this.db.updateMonitorAuthorUserId(guildId, author.username, tweetAuthorId);
             }
-            await this.relayTweet(tweet, author.username, channelId, guildId);
+            const result = await this.relayTweet(tweet, author.username, channelId, guildId);
             this.db.updateMonitorAuthorCursor(guildId, author.username, entry.tweetId, tweet.created_timestamp ?? 0);
-            entry.status = 'posted';
+            entry.status = result.skipped ? 'duplicate' : 'posted';
           }
         }
       } catch (err) {
@@ -464,6 +474,17 @@ export class TweetMonitorService {
     }
     const msg = err instanceof Error ? err.message : String(err);
     return /ECONNRESET|ENOTFOUND|ETIMEDOUT|ECONNREFUSED|network|socket|timeout/i.test(msg);
+  }
+
+  private logRepostSkip(guildId: string, channelId: string, statusId: string, username: string): void {
+    try {
+      const dir = path.resolve(process.cwd(), 'monitor-logs');
+      mkdirSync(dir, { recursive: true });
+      const line = `[${new Date().toISOString()}] scope=${this.getRepostScope()} guild=${guildId} channel=${channelId} status=${statusId} author=${username}\n`;
+      appendFileSync(path.join(dir, 'repost-skip.log'), line, 'utf8');
+    } catch (err) {
+      console.error(`[Monitor] Repost-skip log write failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private async poll(): Promise<void> {
@@ -606,8 +627,8 @@ export class TweetMonitorService {
       if (relayed >= maxCatchup) break; // ponytail: hard cap; overflow only lost on bursts > cap between polls
       if (!channelId) continue;
       try {
-        await this.relayTweet(tweet, author.username, channelId, guildId);
-        relayed++;
+        const result = await this.relayTweet(tweet, author.username, channelId, guildId);
+        if (!result.skipped) relayed++;
       } catch (err) {
         console.error(`[Monitor] Relay @${author.username}/${tweet.id} failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -618,9 +639,16 @@ export class TweetMonitorService {
     }
   }
 
-  private async relayTweet(tweet: MonitorTweet, username: string, channelId: string, guildId: string): Promise<void> {
+  private async relayTweet(tweet: MonitorTweet, username: string, channelId: string, guildId: string): Promise<{ posted: boolean; skipped?: boolean }> {
     const tweetId = String(tweet.id);
     const rawLink = tweet.url || `https://x.com/${username}/status/${tweetId}`;
+    const statusId = extractTweetId(rawLink);
+    if (statusId && this.db.hasBotPostedLink(guildId, channelId, statusId, this.getRepostScope())) {
+      this.logRepostSkip(guildId, channelId, statusId, username);
+      console.log(`[Monitor] Skipped duplicate relay @${username}/${tweetId} (${this.getRepostScope()}, status ${statusId})`);
+      return { posted: false, skipped: true };
+    }
+
     const channel = await this.client.channels.fetch(channelId).catch(() => null);
     if (!channel || !channel.isTextBased()) {
       throw new Error(`target channel ${channelId} is not available`);
@@ -632,8 +660,9 @@ export class TweetMonitorService {
       const fixed = swapDomain(rawLink, fixer);
       try {
         await target.send(fixed);
+        if (statusId) this.db.recordBotPostedLink(guildId, channelId, statusId);
         console.log(`[Monitor] Relayed @${username}/${tweetId} via ${fixer}`);
-        return;
+        return { posted: true };
       } catch (err) {
         lastErr = err;
       }
@@ -641,8 +670,9 @@ export class TweetMonitorService {
 
     try {
       await target.send(rawLink);
+      if (statusId) this.db.recordBotPostedLink(guildId, channelId, statusId);
       console.log(`[Monitor] Relayed @${username}/${tweetId} via raw link`);
-      return;
+      return { posted: true };
     } catch {
       // swallow — lastErr carries the original failure
     }

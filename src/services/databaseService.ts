@@ -145,6 +145,21 @@ export class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_monitor_seen_guild_username_ts
         ON monitor_seen_tweets(guild_id, username, created_timestamp)
     `);
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS bot_posted_links (
+        guild_id TEXT NOT NULL,
+        channel_id TEXT NOT NULL,
+        status_id TEXT NOT NULL,
+        posted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (guild_id, channel_id, status_id)
+      )
+    `);
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_bot_posted_links_status
+        ON bot_posted_links(status_id)
+    `);
   }
 
   private migrateMonitorTables(): void {
@@ -431,6 +446,26 @@ export class DatabaseService {
     } catch {
       return false;
     }
+  }
+
+  hasBotPostedLink(guildId: string, channelId: string, statusId: string, scope: 'PER_GUILD' | 'PER_CHANNEL' | 'GLOBAL'): boolean {
+    let sql: string;
+    if (scope === 'GLOBAL') {
+      sql = 'SELECT 1 FROM bot_posted_links WHERE status_id = ?';
+    } else if (scope === 'PER_GUILD') {
+      sql = 'SELECT 1 FROM bot_posted_links WHERE guild_id = ? AND status_id = ?';
+    } else {
+      sql = 'SELECT 1 FROM bot_posted_links WHERE channel_id = ? AND status_id = ?';
+    }
+    if (scope === 'GLOBAL') return !!this.db.prepare(sql).get(statusId);
+    if (scope === 'PER_GUILD') return !!this.db.prepare(sql).get(guildId, statusId);
+    return !!this.db.prepare(sql).get(channelId, statusId);
+  }
+
+  recordBotPostedLink(guildId: string, channelId: string, statusId: string): void {
+    this.db.prepare(
+      'INSERT OR IGNORE INTO bot_posted_links (guild_id, channel_id, status_id) VALUES (?, ?, ?)'
+    ).run(guildId, channelId, statusId);
   }
 
   getMonitorConfig(guildId: string, key: string, fallback?: string): string | null {
