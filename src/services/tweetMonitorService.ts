@@ -58,6 +58,16 @@ export function extractTweetId(text: string): string | null {
   return match ? match[1] : null;
 }
 
+export function formatMs(ms: number): string {
+  const sec = Math.round(ms / 1000);
+  if (sec >= 60) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return s === 0 ? `${m} min` : `${m}m ${s}s`;
+  }
+  return `${sec} sec`;
+}
+
 export interface ProfileInfo {
   screen_name: string;
   id: string;
@@ -239,9 +249,9 @@ export class TweetMonitorService {
     this.db = db;
   }
 
-  armAwait(guildId: string, channelId: string, requesterId: string, minutes: number, interaction?: ChatInputCommandInteraction): void {
+  armAwait(guildId: string, channelId: string, requesterId: string, durationMs: number, interaction?: ChatInputCommandInteraction): void {
     this.cancelAwait(guildId);
-    const ms = minutes * 60_000;
+    const ms = durationMs;
     const timer = setTimeout(() => {
       this.pendingAwait.delete(guildId);
       void this.client.channels.fetch(channelId).then((ch) => {
@@ -329,16 +339,27 @@ export class TweetMonitorService {
     return this.db.getMonitorConfig(guildId, 'target_channel_id');
   }
 
-  getIntervalMinutes(guildId: string): number {
-    const raw = this.db.getMonitorConfig(guildId, 'poll_interval_minutes');
-    const n = parseInt(raw || '', 10);
-    return Number.isFinite(n) && n >= 1 && n <= 1440 ? n : 15;
+  getIntervalMs(guildId: string): number {
+    let raw = this.db.getMonitorConfig(guildId, 'poll_interval_ms');
+    if (raw == null) {
+      const legacy = this.db.getMonitorConfig(guildId, 'poll_interval_minutes');
+      if (legacy != null) {
+        const n = parseInt(legacy, 10);
+        if (Number.isFinite(n) && n >= 1 && n <= 1440) {
+          raw = String(n * 60_000);
+          this.db.setMonitorConfig(guildId, 'poll_interval_ms', raw);
+        }
+      }
+      this.db.deleteMonitorConfig(guildId, 'poll_interval_minutes');
+    }
+    const n = raw == null ? Number.NaN : parseInt(raw, 10);
+    return Number.isFinite(n) && n >= 1000 && n <= 86_400_000 ? n : 900_000;
   }
 
-  getEffectiveIntervalMinutes(): number {
+  getEffectiveIntervalMs(): number {
     const guilds = this.db.listMonitorGuilds();
-    if (guilds.length === 0) return 15;
-    return Math.min(...guilds.map((g) => this.getIntervalMinutes(g)));
+    if (guilds.length === 0) return 900_000;
+    return Math.min(...guilds.map((g) => this.getIntervalMs(g)));
   }
 
   getFixers(guildId: string): string[] {
@@ -363,8 +384,8 @@ export class TweetMonitorService {
     this.db.setMonitorConfig(guildId, 'target_channel_id', channelId);
   }
 
-  setIntervalMinutes(guildId: string, minutes: number): void {
-    this.db.setMonitorConfig(guildId, 'poll_interval_minutes', String(minutes));
+  setIntervalMs(guildId: string, ms: number): void {
+    this.db.setMonitorConfig(guildId, 'poll_interval_ms', String(ms));
     this.refresh();
   }
 
@@ -449,10 +470,10 @@ export class TweetMonitorService {
     void this.poll();
     this.timer = setInterval(() => {
       void this.poll();
-    }, this.getEffectiveIntervalMinutes() * 60_000);
+    }, this.getEffectiveIntervalMs());
     const authorCount = this.db.listMonitorGuilds()
       .reduce((sum, guildId) => sum + this.db.listMonitorAuthors(guildId).length, 0);
-    console.log(`[Monitor] Started (${this.getEffectiveIntervalMinutes()} min interval, ${authorCount} author(s))`);
+    console.log(`[Monitor] Started (${formatMs(this.getEffectiveIntervalMs())} interval, ${authorCount} author(s))`);
   }
 
   stop(): void {

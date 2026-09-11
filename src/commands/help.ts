@@ -51,11 +51,11 @@ const PAGES: HelpPage[] = [
       '• `list` — show monitored authors + settings',
       '• `channel <channel>` — set where new posts are relayed',
       '• `fixers <domains>` — set the fixer domain order (e.g. `fixupx.com` `fxtwitter.com`)',
-      '• `interval <minutes>` — poll interval (`1`–`1440`)',
+      '• `interval <value> <seconds|minutes>` — poll interval (`1s`–`86400s`, or `1m`–`1440m`)',
       '• `config` — per-author settings (posts/replies/reposts, media-only, hashtag filter) via menus',
       '• `verify` — send a tracked author\'s latest post as a test',
       '• `verify-all` — relay the latest unverified post of every author',
-      '• `await <minutes>` — wait (`1`–`30`, default `5`) for a tweet link, then auto-add its author',
+      '• `await <value> <seconds|minutes>` — wait for a tweet link, then auto-add its author (default `5 minutes`)',
     ].join('\n'),
   },
   {

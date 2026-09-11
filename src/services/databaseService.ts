@@ -480,6 +480,10 @@ export class DatabaseService {
     `).run(guildId, key, value);
   }
 
+  deleteMonitorConfig(guildId: string, key: string): void {
+    this.db.prepare('DELETE FROM monitor_config WHERE guild_id = ? AND key = ?').run(guildId, key);
+  }
+
   close(): void {
     this.db.close();
   }

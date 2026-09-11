@@ -8,7 +8,7 @@ import {
   EmbedBuilder,
 } from 'discord.js';
 import { DatabaseService, MonitorAuthorRow } from '../services/databaseService';
-import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS } from '../services/tweetMonitorService';
+import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS, formatMs } from '../services/tweetMonitorService';
 import { safeEditReply } from '../utils/interactionUtils';
 
 export const MONITOR_VERIFY_SELECT_ID = 'monitor_verify_select';
@@ -103,11 +103,19 @@ export const data = new SlashCommandBuilder()
           .setRequired(true)))
   .addSubcommand(sub =>
     sub.setName('interval')
-      .setDescription('Set the poll interval in minutes')
+      .setDescription('Set the poll interval (seconds or minutes)')
       .addIntegerOption(opt =>
-        opt.setName('minutes')
-          .setDescription('Poll interval (1–1440)')
-          .setRequired(true)))
+        opt.setName('value')
+          .setDescription('Interval value (1–86400 for seconds, 1–1440 for minutes)')
+          .setRequired(true))
+      .addStringOption(opt =>
+        opt.setName('unit')
+          .setDescription('Unit for the value')
+          .setRequired(true)
+          .addChoices(
+            { name: 'seconds', value: 'seconds' },
+            { name: 'minutes', value: 'minutes' },
+          )))
   .addSubcommand(sub =>
     sub.setName('config')
       .setDescription('Configure per-author monitoring (content, media, hashtag filter)'))
@@ -121,9 +129,17 @@ export const data = new SlashCommandBuilder()
     sub.setName('await')
       .setDescription('Wait for a tweet link in chat, then add its author to the monitor')
       .addIntegerOption(opt =>
-        opt.setName('minutes')
-          .setDescription('How long to wait (1–30, default 5)')
-          .setRequired(false)));
+        opt.setName('value')
+          .setDescription('How long to wait (1–1800 seconds or 1–30 minutes, default 5 minutes)')
+          .setRequired(false))
+      .addStringOption(opt =>
+        opt.setName('unit')
+          .setDescription('Unit for the value (default minutes)')
+          .setRequired(false)
+          .addChoices(
+            { name: 'seconds', value: 'seconds' },
+            { name: 'minutes', value: 'minutes' },
+          )));
 
 export async function execute(
   interaction: ChatInputCommandInteraction,
@@ -212,13 +228,15 @@ async function handleAwait(interaction: ChatInputCommandInteraction, monitor: Tw
     await safeEditReply(interaction, 'The monitor service is not available.');
     return;
   }
-  const minutes = interaction.options.getInteger('minutes') ?? 5;
-  if (minutes < 1 || minutes > 30) {
-    await safeEditReply(interaction, 'Wait time must be between 1 and 30 minutes.');
+  const value = interaction.options.getInteger('value') ?? 5;
+  const unit = interaction.options.getString('unit') ?? 'minutes';
+  const ms = unit === 'seconds' ? value * 1000 : value * 60_000;
+  if (value < 1 || ms > 1_800_000) {
+    await safeEditReply(interaction, 'Wait time must be between 1 second and 30 minutes.');
     return;
   }
-  monitor.armAwait(guildId, interaction.channelId, interaction.user.id, minutes, interaction);
-  await safeEditReply(interaction, `Waiting **${minutes} minute(s)** for a tweet link in this server. Paste any \`x.com\` / \`twitter.com\` / \`fxtwitter.com\` / \`fixupx.com\` / \`vxtwitter.com\` post link in any channel — I'll add its author to the monitor.`);
+  monitor.armAwait(guildId, interaction.channelId, interaction.user.id, ms, interaction);
+  await safeEditReply(interaction, `Waiting **${formatMs(ms)}** for a tweet link in this server. Paste any \`x.com\` / \`twitter.com\` / \`fxtwitter.com\` / \`fixupx.com\` / \`vxtwitter.com\` post link in any channel — I'll add its author to the monitor.`);
 }
 
 async function handleRemove(interaction: ChatInputCommandInteraction, db: DatabaseService, guildId: string): Promise<void> {
@@ -462,11 +480,11 @@ async function handleVerifyAll(
 async function handleList(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
   const authors = db.listMonitorAuthors(guildId);
   const channel = db.getMonitorConfig(guildId, 'target_channel_id');
-  const interval = monitor?.getIntervalMinutes(guildId) ?? 15;
+  const interval = monitor?.getIntervalMs(guildId) ?? 900_000;
   const fixers = monitor?.getFixers(guildId) ?? DEFAULT_FIXERS;
 
   const footer =
-    `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${interval} min\n` +
+    `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}\n` +
     `Fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`;
 
   if (authors.length === 0) {
@@ -513,12 +531,14 @@ async function handleFixers(interaction: ChatInputCommandInteraction, db: Databa
 }
 
 async function handleInterval(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
-  const minutes = interaction.options.getInteger('minutes', true);
-  if (minutes < 1 || minutes > 1440) {
-    await safeEditReply(interaction, 'Interval must be between 1 and 1440 minutes.');
+  const value = interaction.options.getInteger('value', true);
+  const unit = interaction.options.getString('unit', true) ?? 'minutes';
+  const ms = unit === 'seconds' ? value * 1000 : value * 60_000;
+  if (value < 1 || ms > 86_400_000) {
+    await safeEditReply(interaction, 'Interval must be between 1 second and 86400 seconds (24 hours).');
     return;
   }
-  db.setMonitorConfig(guildId, 'poll_interval_minutes', String(minutes));
-  monitor?.setIntervalMinutes(guildId, minutes);
-  await safeEditReply(interaction, `Poll interval set to ${minutes} minute(s).`);
+  db.setMonitorConfig(guildId, 'poll_interval_ms', String(ms));
+  monitor?.setIntervalMs(guildId, ms);
+  await safeEditReply(interaction, `Poll interval set to ${formatMs(ms)}.`);
 }
