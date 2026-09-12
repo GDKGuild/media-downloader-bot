@@ -2,13 +2,15 @@ import { Client, TextChannel, Message, ChatInputCommandInteraction } from 'disco
 import axios from 'axios';
 import { appendFileSync, mkdirSync, readFileSync } from 'fs';
 import * as path from 'path';
-import { DatabaseService, MonitorAuthorRow } from './databaseService';
+import { DatabaseService, MonitorAuthorRow, MonitorPlatform } from './databaseService';
+import { fetchIllustOwner, fetchLatestIllusts, parsePixivArtworkId, parsePixivUserId, resolvePixivUser } from './pixivService';
 
 const API_BASE = 'https://api.fxtwitter.com/2/profile';
 const API_STATUS = 'https://api.fxtwitter.com/2/status';
 const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 export const DEFAULT_FIXERS: string[] = ['fixupx.com', 'fixvx.com', 'fxtwitter.com', 'vxtwitter.com', 'cunnyx.com'];
+export const DEFAULT_PIXIV_FIXERS: string[] = ['www.phixiv.net'];
 
 export type RepostScope = 'PER_GUILD' | 'PER_CHANNEL' | 'GLOBAL';
 
@@ -169,7 +171,7 @@ export function tweetIdentity(tweet: MonitorTweet): { id: string | null; screen_
 }
 
 function swapDomain(url: string, domain: string): string {
-  return url.replace(/^https?:\/\/(?:www\.)?(?:x|twitter)\.com/i, `https://${domain}`);
+  return url.replace(/^https?:\/\/(?:www\.)?[a-z0-9.-]+(?::\d+)?/i, `https://${domain}`);
 }
 
 export async function resolveProfile(username: string): Promise<ProfileInfo | null> {
@@ -285,30 +287,59 @@ export class TweetMonitorService {
     if (!pending || pending.expiresAt <= Date.now()) return false;
 
     const tweetId = extractTweetId(message.content);
-    if (!tweetId) return false;
-
-    this.cancelAwait(guildId);
-    try {
-      const author = await resolveTweetAuthor(tweetId);
-      if (!author) {
-        await this.confirmAwait(pending, message, `Could not resolve tweet \`${tweetId}\` — the link may be invalid or the post was deleted. Run \`/monitor await\` to try again.`);
-        return true;
+    if (tweetId) {
+      this.cancelAwait(guildId);
+      try {
+        const author = await resolveTweetAuthor(tweetId);
+        if (!author) {
+          await this.confirmAwait(pending, message, `Could not resolve tweet \`${tweetId}\` — the link may be invalid or the post was deleted. Run \`/monitor await\` to try again.`);
+        } else {
+          const existingById = author.userId ? this.db.findMonitorAuthorByUserId(guildId, author.userId) : null;
+          const existingByCI = this.db.findMonitorAuthorCI(guildId, author.screen_name);
+          const existing = existingById ?? existingByCI;
+          if (existing) {
+            this.db.updateMonitorAuthorUserId(guildId, existing.username, author.userId);
+            await this.confirmAwait(pending, message, `@${existing.username} is already being monitored in this server.`);
+          } else {
+            this.db.addMonitorAuthor(guildId, author.screen_name, author.userId);
+            await this.confirmAwait(pending, message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed after that.`);
+          }
+        }
+      } catch (err) {
+        console.error(`[Monitor] Await resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+        await this.safeAwaitReply(message, 'Something went wrong resolving that tweet. Please try again.');
       }
-      const existingById = author.userId ? this.db.findMonitorAuthorByUserId(guildId, author.userId) : null;
-      const existingByCI = this.db.findMonitorAuthorCI(guildId, author.screen_name);
-      const existing = existingById ?? existingByCI;
-      if (existing) {
-        this.db.updateMonitorAuthorUserId(guildId, existing.username, author.userId);
-        await this.confirmAwait(pending, message, `@${existing.username} is already being monitored in this server.`);
-        return true;
-      }
-      this.db.addMonitorAuthor(guildId, author.screen_name, author.userId);
-      await this.confirmAwait(pending, message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed after that.`);
-    } catch (err) {
-      console.error(`[Monitor] Await resolution failed: ${err instanceof Error ? err.message : String(err)}`);
-      await this.safeAwaitReply(message, 'Something went wrong resolving that tweet. Please try again.');
+      return true;
     }
-    return true;
+
+    const pixivArtworkId = parsePixivArtworkId(message.content);
+    const pixivUserId = parsePixivUserId(message.content);
+    if (pixivArtworkId || pixivUserId) {
+      this.cancelAwait(guildId);
+      try {
+        const ownerInfo = pixivArtworkId
+          ? await fetchIllustOwner(pixivArtworkId)
+          : await resolvePixivUser(pixivUserId!);
+        if (!ownerInfo) {
+          await this.confirmAwait(pending, message, `Could not resolve that pixiv link. Paste a user page or artwork URL, then run \`/monitor await\` to try again.`);
+        } else {
+          const owner = { userId: ownerInfo.userId, userName: 'userName' in ownerInfo ? ownerInfo.userName : ownerInfo.name };
+          const existing = this.db.findMonitorAuthorByUserId(guildId, owner.userId);
+          if (existing) {
+            await this.confirmAwait(pending, message, `${owner.userName} (\`${owner.userId}\`) is already being monitored in this server.`);
+          } else {
+            this.db.addMonitorAuthor(guildId, owner.userId, owner.userId, 'pixiv', owner.userName);
+            await this.confirmAwait(pending, message, `Now monitoring pixiv user **${owner.userName}** (\`${owner.userId}\`). The next poll baselines their gallery; new artworks are relayed after that.`);
+          }
+        }
+      } catch (err) {
+        console.error(`[Monitor] Await pixiv resolution failed: ${err instanceof Error ? err.message : String(err)}`);
+        await this.safeAwaitReply(message, 'Something went wrong resolving that pixiv link. Please try again.');
+      }
+      return true;
+    }
+
+    return false;
   }
 
   private async safeAwaitReply(message: Message, content: string): Promise<void> {
@@ -362,8 +393,10 @@ export class TweetMonitorService {
     return Math.min(...guilds.map((g) => this.getIntervalMs(g)));
   }
 
-  getFixers(guildId: string): string[] {
-    const raw = this.db.getMonitorConfig(guildId, 'fixer_list');
+  getFixers(guildId: string, platform: MonitorPlatform = 'twitter'): string[] {
+    const key = platform === 'pixiv' ? 'pixiv_fixer_list' : 'fixer_list';
+    const defaults = platform === 'pixiv' ? [...DEFAULT_PIXIV_FIXERS] : [...DEFAULT_FIXERS];
+    const raw = this.db.getMonitorConfig(guildId, key);
     if (raw) {
       try {
         const arr = JSON.parse(raw) as unknown;
@@ -372,7 +405,7 @@ export class TweetMonitorService {
         // fall through to defaults
       }
     }
-    return [...DEFAULT_FIXERS];
+    return defaults;
   }
 
   getRepostScope(): RepostScope {
@@ -389,8 +422,9 @@ export class TweetMonitorService {
     this.refresh();
   }
 
-  setFixers(guildId: string, list: string[]): void {
-    this.db.setMonitorConfig(guildId, 'fixer_list', JSON.stringify(list));
+  setFixers(guildId: string, list: string[], platform: MonitorPlatform = 'twitter'): void {
+    const key = platform === 'pixiv' ? 'pixiv_fixer_list' : 'fixer_list';
+    this.db.setMonitorConfig(guildId, key, JSON.stringify(list));
   }
 
   cancelVerifyAll(): void {
@@ -398,6 +432,7 @@ export class TweetMonitorService {
   }
 
   async verify(author: MonitorAuthorRow, guildId: string): Promise<MonitorVerifyResult> {
+    if (author.platform === 'pixiv') return this.verifyPixiv(author, guildId);
     const tweet = await fetchLatestTweet(author.username);
     if (!tweet) return { found: false, tweetId: null, channelId: null, posted: false };
 
@@ -423,6 +458,25 @@ export class TweetMonitorService {
     }
   }
 
+  private async verifyPixiv(author: MonitorAuthorRow, guildId: string): Promise<MonitorVerifyResult> {
+    const illusts = await fetchLatestIllusts(author.username);
+    if (illusts.length === 0) return { found: false, tweetId: null, channelId: null, posted: false };
+    const illust = illusts[0];
+
+    const channelId = this.getChannelId(guildId);
+    if (!channelId) return { found: true, tweetId: illust.id, channelId: null, posted: false };
+    try {
+      const result = await this.relayPixivArt(illust.id, author.display_name, channelId, guildId);
+      if (result.skipped) {
+        return { found: true, tweetId: illust.id, channelId, posted: false, reason: 'duplicate' };
+      }
+      return { found: true, tweetId: illust.id, channelId, posted: true };
+    } catch (err) {
+      console.error(`[Monitor] Verify relay pixiv ${this.authorLabel(author)}/${illust.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { found: true, tweetId: illust.id, channelId, posted: false };
+    }
+  }
+
   async verifyAll(guildId: string): Promise<MonitorVerifyAllResult> {
     const channelId = this.getChannelId(guildId);
     const authors = this.db.listMonitorAuthors(guildId);
@@ -435,24 +489,40 @@ export class TweetMonitorService {
       }
       const entry: MonitorVerifyAllEntry = { username: author.username, status: 'no-posts', tweetId: null };
       try {
-        const tweet = await fetchLatestTweet(author.username);
-        if (tweet) {
-          entry.tweetId = String(tweet.id);
-          const tweetAuthorId = tweetIdentity(tweet).id;
-          const identityOk = !author.user_id || (tweetAuthorId && author.user_id === tweetAuthorId);
-          if (!identityOk) {
-            entry.status = 'identity-mismatch';
-          } else if (author.last_tweet_id === entry.tweetId) {
-            entry.status = 'skipped';
-          } else if (!channelId) {
-            entry.status = 'no-channel';
-          } else {
-            if (!author.user_id && tweetAuthorId) {
-              this.db.updateMonitorAuthorUserId(guildId, author.username, tweetAuthorId);
+        if (author.platform === 'pixiv') {
+          const illusts = await fetchLatestIllusts(author.username);
+          if (illusts.length > 0) {
+            entry.tweetId = illusts[0].id;
+            if (author.last_tweet_id === entry.tweetId) {
+              entry.status = 'skipped';
+            } else if (!channelId) {
+              entry.status = 'no-channel';
+            } else {
+              const result = await this.relayPixivArt(illusts[0].id, author.display_name, channelId, guildId);
+              this.db.updateMonitorAuthorCursor(guildId, author.username, entry.tweetId, Date.parse(illusts[0].createDate) || 0);
+              entry.status = result.skipped ? 'duplicate' : 'posted';
             }
-            const result = await this.relayTweet(tweet, author.username, channelId, guildId);
-            this.db.updateMonitorAuthorCursor(guildId, author.username, entry.tweetId, tweet.created_timestamp ?? 0);
-            entry.status = result.skipped ? 'duplicate' : 'posted';
+          }
+        } else {
+          const tweet = await fetchLatestTweet(author.username);
+          if (tweet) {
+            entry.tweetId = String(tweet.id);
+            const tweetAuthorId = tweetIdentity(tweet).id;
+            const identityOk = !author.user_id || (tweetAuthorId && author.user_id === tweetAuthorId);
+            if (!identityOk) {
+              entry.status = 'identity-mismatch';
+            } else if (author.last_tweet_id === entry.tweetId) {
+              entry.status = 'skipped';
+            } else if (!channelId) {
+              entry.status = 'no-channel';
+            } else {
+              if (!author.user_id && tweetAuthorId) {
+                this.db.updateMonitorAuthorUserId(guildId, author.username, tweetAuthorId);
+              }
+              const result = await this.relayTweet(tweet, author.username, channelId, guildId);
+              this.db.updateMonitorAuthorCursor(guildId, author.username, entry.tweetId, tweet.created_timestamp ?? 0);
+              entry.status = result.skipped ? 'duplicate' : 'posted';
+            }
           }
         }
       } catch (err) {
@@ -598,6 +668,10 @@ export class TweetMonitorService {
   }
 
   private async pollAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
+    if (author.platform === 'pixiv') {
+      await this.pollPixivAuthor(author, guildId, channelId);
+      return;
+    }
     const tweets = await this.fetchStatuses(author.username, author);
     if (tweets.length === 0) return;
 
@@ -660,13 +734,67 @@ export class TweetMonitorService {
     }
   }
 
+  private authorLabel(author: MonitorAuthorRow): string {
+    return author.platform === 'pixiv'
+      ? `${author.display_name ?? author.username} (${author.username})`
+      : `@${author.username}`;
+  }
+
+  private async pollPixivAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
+    const illusts = await fetchLatestIllusts(author.username);
+    if (illusts.length === 0) return;
+
+    const newest = illusts[0];
+    const newestId = newest.id;
+    const newestTs = Date.parse(newest.createDate) || 0;
+
+    if (author.last_tweet_id == null) {
+      this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
+      console.log(`[Monitor] pixiv ${this.authorLabel(author)}: baselined at ${newestId} (no relay on first poll)`);
+      return;
+    }
+
+    const cursorIdx = illusts.findIndex((i) => i.id === author.last_tweet_id);
+    const newItems = cursorIdx !== -1
+      ? illusts.slice(0, cursorIdx)
+      : author.last_tweet_ts != null
+        ? illusts.filter((i) => (Date.parse(i.createDate) || 0) > author.last_tweet_ts!)
+        : illusts;
+
+    let relayed = 0;
+    const maxCatchup = getMaxCatchup();
+    for (const item of newItems) {
+      if (relayed >= maxCatchup) break; // ponytail: hard cap; overflow only lost on bursts > cap between polls
+      if (!channelId) continue;
+      try {
+        const result = await this.relayPixivArt(item.id, author.display_name, channelId, guildId);
+        if (!result.skipped) relayed++;
+      } catch (err) {
+        console.error(`[Monitor] Relay pixiv ${this.authorLabel(author)}/${item.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    this.db.updateMonitorAuthorCursor(guildId, author.username, newestId, newestTs);
+    if (relayed > 0) {
+      console.log(`[Monitor] pixiv ${this.authorLabel(author)}: ${relayed} new artwork(s) relayed, cursor at ${newestId}`);
+    }
+  }
+
   private async relayTweet(tweet: MonitorTweet, username: string, channelId: string, guildId: string): Promise<{ posted: boolean; skipped?: boolean }> {
     const tweetId = String(tweet.id);
     const rawLink = tweet.url || `https://x.com/${username}/status/${tweetId}`;
     const statusId = extractTweetId(rawLink);
-    if (statusId && this.db.hasBotPostedLink(guildId, channelId, statusId, this.getRepostScope())) {
-      this.logRepostSkip(guildId, channelId, statusId, username);
-      console.log(`[Monitor] Skipped duplicate relay @${username}/${tweetId} (${this.getRepostScope()}, status ${statusId})`);
+    return this.sendLink(rawLink, statusId ? `x:${statusId}` : null, `@${username}/${tweetId}`, channelId, guildId, this.getFixers(guildId, 'twitter'));
+  }
+
+  private async relayPixivArt(illustId: string, displayName: string | null, channelId: string, guildId: string): Promise<{ posted: boolean; skipped?: boolean }> {
+    const rawLink = `https://www.pixiv.net/en/artworks/${illustId}`;
+    return this.sendLink(rawLink, `pixiv:${illustId}`, `${displayName ?? illustId}/${illustId}`, channelId, guildId, this.getFixers(guildId, 'pixiv'));
+  }
+
+  private async sendLink(rawLink: string, dedupKey: string | null, label: string, channelId: string, guildId: string, fixers: string[]): Promise<{ posted: boolean; skipped?: boolean }> {
+    if (dedupKey && this.db.hasBotPostedLink(guildId, channelId, dedupKey, this.getRepostScope())) {
+      this.logRepostSkip(guildId, channelId, dedupKey, label);
+      console.log(`[Monitor] Skipped duplicate relay ${label} (${this.getRepostScope()}, ${dedupKey})`);
       return { posted: false, skipped: true };
     }
 
@@ -677,12 +805,12 @@ export class TweetMonitorService {
     const target = channel as TextChannel;
 
     let lastErr: unknown = null;
-    for (const fixer of this.getFixers(guildId)) {
+    for (const fixer of fixers) {
       const fixed = swapDomain(rawLink, fixer);
       try {
         await target.send(fixed);
-        if (statusId) this.db.recordBotPostedLink(guildId, channelId, statusId);
-        console.log(`[Monitor] Relayed @${username}/${tweetId} via ${fixer}`);
+        if (dedupKey) this.db.recordBotPostedLink(guildId, channelId, dedupKey);
+        console.log(`[Monitor] Relayed ${label} via ${fixer}`);
         return { posted: true };
       } catch (err) {
         lastErr = err;
@@ -691,8 +819,8 @@ export class TweetMonitorService {
 
     try {
       await target.send(rawLink);
-      if (statusId) this.db.recordBotPostedLink(guildId, channelId, statusId);
-      console.log(`[Monitor] Relayed @${username}/${tweetId} via raw link`);
+      if (dedupKey) this.db.recordBotPostedLink(guildId, channelId, dedupKey);
+      console.log(`[Monitor] Relayed ${label} via raw link`);
       return { posted: true };
     } catch {
       // swallow — lastErr carries the original failure
