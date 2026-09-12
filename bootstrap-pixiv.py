@@ -20,7 +20,7 @@ from pprint import pprint
 import requests
 
 CLIENT_ID = "MOBrBDS8blbauoSck0ZfDbtuzpyT"
-CLIENT_SECRET = "lsACyCD94FhDUtGTt3rICEnzx6RuOa"
+CLIENT_SECRET = "lsACyCD94FhDUtGTXi3QzcFE2uU1hqtDaKeqrdwj"
 REDIRECT_URI = "https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback"
 LOGIN_URL = "https://app-api.pixiv.net/web/v1/login"
 AUTH_TOKEN_URL = "https://oauth.secure.pixiv.net/auth/token"
@@ -55,8 +55,9 @@ def login(_ns=None):
     })}"
     webbrowser.open(login_url)
     print("Opened the Pixiv login page in your browser.")
-    print("Log in and authorize. After authorizing you'll land on a blank page;")
-    print("paste the full callback URL from the address bar below (or just its code):")
+    print("Log in and authorize. After authorizing, WAIT until you reach the blank page whose")
+    print("address starts with app-api.pixiv.net/web/v1/users/auth/pixiv/callback and contains 'code='.")
+    print("Paste that full address (or just its code):")
     raw = input("Callback URL or code: ").strip()
 
     parsed = urllib.parse.urlparse(raw)

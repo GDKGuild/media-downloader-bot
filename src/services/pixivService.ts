@@ -1,9 +1,9 @@
 import axios from 'axios';
 
 const PIXIV_OAUTH_URL = 'https://oauth.secure.pixiv.net/auth/token';
-const PIXIV_API_BASE = 'https://app-api.pixiv.net/v1';
+const PIXIV_API_BASE = 'https://app-api.pixiv.net';
 const PIXIV_CLIENT_ID = 'MOBrBDS8blbauoSck0ZfDbtuzpyT';
-const PIXIV_CLIENT_SECRET = 'lsACyCD94FhDUtGTt3rICEnzx6RuOa';
+const PIXIV_CLIENT_SECRET = 'lsACyCD94FhDUtGTXi3QzcFE2uU1hqtDaKeqrdwj';
 const PIXIV_UA = 'PixivIOSApp/7.16.8 (iOS 16.4.1; iPhone14,3)';
 
 export interface PixivUserInfo {
