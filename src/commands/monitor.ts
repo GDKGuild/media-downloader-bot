@@ -7,8 +7,9 @@ import {
   MessageFlags,
   EmbedBuilder,
 } from 'discord.js';
-import { DatabaseService, MonitorAuthorRow } from '../services/databaseService';
-import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS, formatMs } from '../services/tweetMonitorService';
+import { DatabaseService, MonitorAuthorRow, MonitorPlatform } from '../services/databaseService';
+import { TweetMonitorService, normalizeUsername, resolveProfile, DEFAULT_FIXERS, DEFAULT_PIXIV_FIXERS, formatMs } from '../services/tweetMonitorService';
+import { resolvePixivUser } from '../services/pixivService';
 import { safeEditReply } from '../utils/interactionUtils';
 
 export const MONITOR_VERIFY_SELECT_ID = 'monitor_verify_select';
@@ -43,7 +44,14 @@ function parseFlags(flags: string): { include_posts: number; include_replies: nu
   return { include_posts: p, include_replies: r, include_reposts: s };
 }
 
+function authorName(a: MonitorAuthorRow): string {
+  return a.platform === 'pixiv'
+    ? `${a.display_name ?? a.username} (pixiv)`
+    : `@${a.username}`;
+}
+
 function configSummary(a: MonitorAuthorRow): string {
+  if (a.platform === 'pixiv') return 'artworks';
   const content = [
     a.include_posts ? 'posts' : null,
     a.include_replies ? 'replies' : null,
@@ -66,14 +74,22 @@ function makeSelectRow(
 
 export const data = new SlashCommandBuilder()
   .setName('monitor')
-  .setDescription('Manage Twitter/X author monitoring')
+  .setDescription('Manage social media author monitoring')
   .addSubcommand(sub =>
     sub.setName('add')
       .setDescription('Add an author to monitor')
       .addStringOption(opt =>
         opt.setName('username')
-          .setDescription('Twitter handle (without @)')
-          .setRequired(true)))
+          .setDescription('Twitter handle (without @) or pixiv user ID/URL')
+          .setRequired(true))
+      .addStringOption(opt =>
+        opt.setName('platform')
+          .setDescription('Platform to monitor (default twitter)')
+          .setRequired(false)
+          .addChoices(
+            { name: 'twitter', value: 'twitter' },
+            { name: 'pixiv', value: 'pixiv' },
+          )))
   .addSubcommand(sub =>
     sub.setName('remove')
       .setDescription('Stop monitoring an author')
@@ -100,7 +116,15 @@ export const data = new SlashCommandBuilder()
       .addStringOption(opt =>
         opt.setName('domains')
           .setDescription('e.g. fixupx.com fixvx.com fxtwitter.com vxtwitter.com')
-          .setRequired(true)))
+          .setRequired(true))
+      .addStringOption(opt =>
+        opt.setName('platform')
+          .setDescription('Which platform this fixer list applies to (default twitter)')
+          .setRequired(false)
+          .addChoices(
+            { name: 'twitter', value: 'twitter' },
+            { name: 'pixiv', value: 'pixiv' },
+          )))
   .addSubcommand(sub =>
     sub.setName('interval')
       .setDescription('Set the poll interval (seconds or minutes)')
@@ -196,6 +220,25 @@ export async function execute(
 
 async function handleAdd(interaction: ChatInputCommandInteraction, db: DatabaseService, guildId: string): Promise<void> {
   const raw = interaction.options.getString('username', true);
+  const platform = (interaction.options.getString('platform') ?? 'twitter') as MonitorPlatform;
+
+  if (platform === 'pixiv') {
+    await safeEditReply(interaction, `Resolving pixiv user \`${raw}\`...`);
+    const user = await resolvePixivUser(raw);
+    if (!user) {
+      await safeEditReply(interaction, `\`${raw}\` is not a valid pixiv user ID or \`/users/\` link.`);
+      return;
+    }
+    const existing = db.findMonitorAuthorByUserId(guildId, user.userId);
+    if (existing) {
+      await safeEditReply(interaction, `That pixiv artist is already being monitored here as ${authorName(existing)}.`);
+      return;
+    }
+    db.addMonitorAuthor(guildId, user.userId, user.userId, 'pixiv', user.name);
+    await safeEditReply(interaction, `Now monitoring pixiv artist **${user.name}** (\`${user.userId}\`). The next poll baselines their gallery; new artworks are relayed after that.`);
+    return;
+  }
+
   const username = normalizeUsername(raw);
   if (!username) {
     await safeEditReply(interaction, `Invalid username \`${raw}\`. Use 1–15 letters, numbers, or underscores.`);
@@ -236,7 +279,7 @@ async function handleAwait(interaction: ChatInputCommandInteraction, monitor: Tw
     return;
   }
   monitor.armAwait(guildId, interaction.channelId, interaction.user.id, ms, interaction);
-  await safeEditReply(interaction, `Waiting **${formatMs(ms)}** for a tweet link in this server. Paste any \`x.com\` / \`twitter.com\` / \`fxtwitter.com\` / \`fixupx.com\` / \`vxtwitter.com\` post link in any channel — I'll add its author to the monitor.`);
+  await safeEditReply(interaction, `Waiting **${formatMs(ms)}** for a link in this server. Paste any \`x.com\` / \`twitter.com\` tweet link or a \`pixiv.net\` / \`phixiv.net\` artwork or user link in any channel — I'll add its author to the monitor.`);
 }
 
 async function handleRemove(interaction: ChatInputCommandInteraction, db: DatabaseService, guildId: string): Promise<void> {
@@ -280,9 +323,9 @@ async function handleVerify(
     return;
   }
   const options = authors.slice(0, 25).map((a, i) => ({
-    label: `${i + 1}. @${a.username}`,
+    label: `${i + 1}. ${authorName(a)}`,
     value: a.username,
-    description: a.user_id ? `user ${a.user_id}` : 'user id unknown',
+    description: a.platform === 'pixiv' ? `pixiv user ${a.username}` : (a.user_id ? `user ${a.user_id}` : 'user id unknown'),
   }));
   const select = new StringSelectMenuBuilder()
     .setCustomId(MONITOR_VERIFY_SELECT_ID)
@@ -318,26 +361,27 @@ export async function handleVerifySelect(
     const channelId = monitor.getChannelId(guildId);
     if (!channelId) {
       await interaction.editReply({
-        content: `@${author.username} is monitored, but no target channel is set. Run \`/monitor channel\` first.`,
+        content: `${authorName(author)} is monitored, but no target channel is set. Run \`/monitor channel\` first.`,
         components: [],
       });
       return;
     }
-    await interaction.editReply({ content: `Fetching latest post from @${author.username}...`, components: [] });
+    const kind = author.platform === 'pixiv' ? 'artwork' : 'post';
+    await interaction.editReply({ content: `Fetching latest ${kind} from ${authorName(author)}...`, components: [] });
     const result = await monitor.verify(author, guildId);
     let message: string;
     if (result.reason === 'identity-mismatch') {
       message = `Cannot verify @${author.username} — the handle now belongs to a different account than the tracked user \`${author.user_id}\` (handle recycled). Remove it and re-add the author with the current handle.`;
     } else if (result.reason === 'duplicate') {
-      message = `@${author.username}'s latest post (\`${result.tweetId}\`) was already sent to <#${channelId}> — skipped (bot does not repost the same link).`;
+      message = `${authorName(author)}'s latest ${kind} (\`${result.tweetId}\`) was already sent to <#${channelId}> — skipped (bot does not repost the same link).`;
     } else if (!result.found) {
-      message = `@${author.username} has no posts with media (or could not be fetched).`;
+      message = `${authorName(author)} has no ${kind === 'artwork' ? 'artworks' : 'posts with media'} (or could not be fetched).`;
     } else if (!result.channelId) {
-      message = `@${author.username}'s latest post is \`${result.tweetId}\`, but no target channel is set. Run \`/monitor channel\` first.`;
+      message = `${authorName(author)}'s latest ${kind} is \`${result.tweetId}\`, but no target channel is set. Run \`/monitor channel\` first.`;
     } else {
       message = result.posted
-        ? `Sent @${author.username}'s latest post (\`${result.tweetId}\`) to <#${channelId}>.`
-        : `Found @${author.username}'s latest post (\`${result.tweetId}\`), but failed to post to <#${channelId}>.`;
+        ? `Sent ${authorName(author)}'s latest ${kind} (\`${result.tweetId}\`) to <#${channelId}>.`
+        : `Found ${authorName(author)}'s latest ${kind} (\`${result.tweetId}\`), but failed to post to <#${channelId}>.`;
     }
     await interaction.editReply(message);
   } catch (err) {
@@ -357,7 +401,7 @@ async function handleConfig(interaction: ChatInputCommandInteraction, db: Databa
     return;
   }
   const options = authors.slice(0, 25).map((a, i) => ({
-    label: `${i + 1}. @${a.username}`,
+    label: `${i + 1}. ${authorName(a)}`,
     value: a.username,
     description: configSummary(a),
   }));
@@ -383,6 +427,14 @@ export async function handleConfigSelect(interaction: StringSelectMenuInteractio
     switch (step) {
       case 'author': {
         const username = value;
+        const author = db.getMonitorAuthor(guildId, username);
+        if (author?.platform === 'pixiv') {
+          await interaction.editReply({
+            content: `**${author.display_name ?? author.username}** is a pixiv artist — new artworks are always relayed. Pixiv filtering is not supported yet.`,
+            components: [],
+          });
+          break;
+        }
         await render(
           `**@${username} — what to include?**`,
           makeSelectRow(`${CONFIG_STEP_CONTENT}:${username}`, 'Choose content types', CONTENT_OPTIONS),
@@ -458,14 +510,16 @@ async function handleVerifyAll(
   await safeEditReply(interaction, `Verifying ${authors.length} author(s)...`);
   const result = await monitor.verifyAll(guildId);
   const lines = result.entries.map((e) => {
+    const a = db.getMonitorAuthor(guildId, e.username);
+    const name = a ? authorName(a) : `@${e.username}`;
     switch (e.status) {
-      case 'posted': return `\`@${e.username}\` → sent \`${e.tweetId}\``;
-      case 'skipped': return `\`@${e.username}\` → skipped (already up to date)`;
-      case 'duplicate': return `\`@${e.username}\` → already posted, skipped`;
-      case 'identity-mismatch': return `\`@${e.username}\` → handle now belongs to a different account; remove and re-add`;
-      case 'no-posts': return `\`@${e.username}\` → no posts with media found`;
-      case 'no-channel': return `\`@${e.username}\` → no channel set`;
-      default: return `\`@${e.username}\` → failed`;
+      case 'posted': return `\`${name}\` → sent \`${e.tweetId}\``;
+      case 'skipped': return `\`${name}\` → skipped (already up to date)`;
+      case 'duplicate': return `\`${name}\` → already posted, skipped`;
+      case 'identity-mismatch': return `\`${name}\` → handle now belongs to a different account; remove and re-add`;
+      case 'no-posts': return `\`${name}\` → no posts with media found`;
+      case 'no-channel': return `\`${name}\` → no channel set`;
+      default: return `\`${name}\` → failed`;
     }
   });
   const header = result.aborted
@@ -482,19 +536,21 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
   const channel = db.getMonitorConfig(guildId, 'target_channel_id');
   const interval = monitor?.getIntervalMs(guildId) ?? 900_000;
   const fixers = monitor?.getFixers(guildId) ?? DEFAULT_FIXERS;
+  const pixivFixers = monitor?.getFixers(guildId, 'pixiv') ?? DEFAULT_PIXIV_FIXERS;
 
   const footer =
     `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}\n` +
-    `Fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`;
+    `X fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}\n` +
+    `Pixiv fixers: ${pixivFixers.map((f) => `\`${f}\``).join(' ')}`;
 
   if (authors.length === 0) {
     await safeEditReply(interaction,
-      `No authors being monitored in this server yet. Use \`/monitor add <username>\`.\n\n${footer}`);
+      `No authors being monitored in this server yet. Use \`/monitor add <username>\` (or \`platform=pixiv\` with a pixiv user ID/URL).\n\n${footer}`);
     return;
   }
 
   const lines = authors.map((a) =>
-    `\`${a.user_id ?? '?'}\` - \`@${a.username}\` — ${configSummary(a)}` +
+    `\`${a.user_id ?? '?'}\` - ${authorName(a)} — ${configSummary(a)}` +
     (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
@@ -512,6 +568,7 @@ async function handleChannel(interaction: ChatInputCommandInteraction, db: Datab
 }
 
 async function handleFixers(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
+  const platform = (interaction.options.getString('platform') ?? 'twitter') as MonitorPlatform;
   const raw = interaction.options.getString('domains', true);
   const list = raw
     .split(/[\s,]+/)
@@ -522,11 +579,11 @@ async function handleFixers(interaction: ChatInputCommandInteraction, db: Databa
     await safeEditReply(interaction, `No valid fixer domains in \`${raw}\`.`);
     return;
   }
-  db.setMonitorConfig(guildId, 'fixer_list', JSON.stringify(valid));
-  monitor?.setFixers(guildId, valid);
+  db.setMonitorConfig(guildId, platform === 'pixiv' ? 'pixiv_fixer_list' : 'fixer_list', JSON.stringify(valid));
+  monitor?.setFixers(guildId, valid, platform);
   const dropped = list.length - valid.length;
   await safeEditReply(interaction,
-    `Fixer list set (in order): ${valid.map((d) => `\`${d}\``).join(' ')}` +
+    `${platform} fixer list set (in order): ${valid.map((d) => `\`${d}\``).join(' ')}` +
     (dropped > 0 ? `\nSkipped ${dropped} invalid domain(s).` : ''));
 }
 
