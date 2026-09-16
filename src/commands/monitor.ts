@@ -50,6 +50,12 @@ function authorName(a: MonitorAuthorRow): string {
     : `@${a.username}`;
 }
 
+function bindingText(db: DatabaseService, guildId: string, a: MonitorAuthorRow): string {
+  if (a.channel_id) return `, bound to <#${a.channel_id}>`;
+  const def = db.getMonitorConfig(guildId, 'target_channel_id');
+  return def ? `, relaying to the server default <#${def}>` : ' with no channel bound';
+}
+
 function configSummary(a: MonitorAuthorRow): string {
   if (a.platform === 'pixiv') return 'artworks';
   const content = [
@@ -105,11 +111,15 @@ export const data = new SlashCommandBuilder()
       .setDescription('Show monitored authors and settings'))
   .addSubcommand(sub =>
     sub.setName('channel')
-      .setDescription('Set the channel where new posts are relayed')
+      .setDescription('Set the relay channel (server default, or per-author with a username)')
       .addChannelOption(opt =>
         opt.setName('channel')
           .setDescription('Target channel')
-          .setRequired(true)))
+          .setRequired(true))
+      .addStringOption(opt =>
+        opt.setName('username')
+          .setDescription('Optional — bind this one author to the channel instead of setting the server default')
+          .setRequired(false)))
   .addSubcommand(sub =>
     sub.setName('fixers')
       .setDescription('Set the ordered fixer domain list (space or comma separated)')
@@ -231,11 +241,11 @@ async function handleAdd(interaction: ChatInputCommandInteraction, db: DatabaseS
     }
     const existing = db.findMonitorAuthorByUserId(guildId, user.userId);
     if (existing) {
-      await safeEditReply(interaction, `That pixiv artist is already being monitored here as ${authorName(existing)}.`);
+      await safeEditReply(interaction, `That pixiv artist is already being monitored here as ${authorName(existing)}${bindingText(db, guildId, existing)}. Run \`/monitor channel <#channel> <username>\` to move it.`);
       return;
     }
-    db.addMonitorAuthor(guildId, user.userId, user.userId, 'pixiv', user.name);
-    await safeEditReply(interaction, `Now monitoring pixiv artist **${user.name}** (\`${user.userId}\`). The next poll baselines their gallery; new artworks are relayed after that.`);
+    db.addMonitorAuthor(guildId, user.userId, user.userId, 'pixiv', user.name, interaction.channelId);
+    await safeEditReply(interaction, `Now monitoring pixiv artist **${user.name}** (\`${user.userId}\`), relaying to <#${interaction.channelId}>. The next poll baselines their gallery; new artworks are relayed there after that.`);
     return;
   }
 
@@ -253,17 +263,17 @@ async function handleAdd(interaction: ChatInputCommandInteraction, db: DatabaseS
   if (profile.id) {
     const existingById = db.findMonitorAuthorByUserId(guildId, profile.id);
     if (existingById) {
-      await safeEditReply(interaction, `That account is already being monitored here as @${existingById.username}.`);
+      await safeEditReply(interaction, `That account is already being monitored here as @${existingById.username}${bindingText(db, guildId, existingById)}. Run \`/monitor channel <#channel> <username>\` to move it.`);
       return;
     }
   }
   const existing = db.findMonitorAuthorCI(guildId, profile.screen_name);
   if (existing) {
-    await safeEditReply(interaction, `@${existing.username} is already being monitored here.`);
+    await safeEditReply(interaction, `@${existing.username} is already being monitored here${bindingText(db, guildId, existing)}. Run \`/monitor channel <#channel> <username>\` to move it.`);
     return;
   }
-  db.addMonitorAuthor(guildId, profile.screen_name, profile.id);
-  await safeEditReply(interaction, `Now monitoring @${profile.screen_name}. The next poll baselines their timeline; new posts are relayed after that.`);
+  db.addMonitorAuthor(guildId, profile.screen_name, profile.id, 'twitter', null, interaction.channelId);
+  await safeEditReply(interaction, `Now monitoring @${profile.screen_name}, relaying to <#${interaction.channelId}>. The next poll baselines their timeline; new posts are relayed there after that.`);
 }
 
 async function handleAwait(interaction: ChatInputCommandInteraction, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
@@ -322,11 +332,16 @@ async function handleVerify(
     await safeEditReply(interaction, 'No authors are being monitored in this server yet. Use `/monitor add <username>` first.');
     return;
   }
-  const options = authors.slice(0, 25).map((a, i) => ({
-    label: `${i + 1}. ${authorName(a)}`,
-    value: a.username,
-    description: a.platform === 'pixiv' ? `pixiv user ${a.username}` : (a.user_id ? `user ${a.user_id}` : 'user id unknown'),
-  }));
+  const options = authors.slice(0, 25).map((a, i) => {
+    const bound = a.channel_id
+      ? ` in <#${a.channel_id}>`
+      : (monitor.getAuthorChannel(guildId, a) ? ' (server default channel)' : ' — no channel');
+    return {
+      label: `${i + 1}. ${authorName(a)}`,
+      value: a.username,
+      description: (a.platform === 'pixiv' ? `pixiv user ${a.username}` : (a.user_id ? `user ${a.user_id}` : 'user id unknown')) + bound,
+    };
+  });
   const select = new StringSelectMenuBuilder()
     .setCustomId(MONITOR_VERIFY_SELECT_ID)
     .setPlaceholder('Choose an author to verify')
@@ -358,10 +373,10 @@ export async function handleVerifySelect(
       await interaction.editReply({ content: `@${username} is no longer being monitored here.`, components: [] });
       return;
     }
-    const channelId = monitor.getChannelId(guildId);
+    const channelId = monitor.getAuthorChannel(guildId, author);
     if (!channelId) {
       await interaction.editReply({
-        content: `${authorName(author)} is monitored, but no target channel is set. Run \`/monitor channel\` first.`,
+        content: `${authorName(author)} is monitored, but has no relay channel. Set one with \`/monitor channel <#channel> <username>\` (or set the server default).`,
         components: [],
       });
       return;
@@ -502,9 +517,12 @@ async function handleVerifyAll(
     await safeEditReply(interaction, 'No authors are being monitored in this server yet. Use `/monitor add <username>` first.');
     return;
   }
-  const channelId = monitor.getChannelId(guildId);
-  if (!channelId) {
-    await safeEditReply(interaction, 'No target channel is set. Run `/monitor channel` first.');
+  if (!monitor) {
+    await safeEditReply(interaction, 'The monitor service is not available.');
+    return;
+  }
+  if (authors.every((a) => !monitor.getAuthorChannel(guildId, a))) {
+    await safeEditReply(interaction, 'None of the monitored authors have a relay channel. Set one with `/monitor channel <#channel> <username>` (or the server default).');
     return;
   }
   await safeEditReply(interaction, `Verifying ${authors.length} author(s)...`);
@@ -513,7 +531,7 @@ async function handleVerifyAll(
     const a = db.getMonitorAuthor(guildId, e.username);
     const name = a ? authorName(a) : `@${e.username}`;
     switch (e.status) {
-      case 'posted': return `\`${name}\` → sent \`${e.tweetId}\``;
+      case 'posted': return `\`${name}\` → sent \`${e.tweetId}\` to ${e.channelId ? `<#${e.channelId}>` : 'their channel'}`;
       case 'skipped': return `\`${name}\` → skipped (already up to date)`;
       case 'duplicate': return `\`${name}\` → already posted, skipped`;
       case 'identity-mismatch': return `\`${name}\` → handle now belongs to a different account; remove and re-add`;
@@ -527,8 +545,7 @@ async function handleVerifyAll(
     : `**Verify all (${result.entries.length} tracked)**`;
   await safeEditReply(interaction,
     header + '\n' +
-    lines.join('\n') +
-    `\nChannel: <#${channelId}>`);
+    lines.join('\n'));
 }
 
 async function handleList(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
@@ -539,7 +556,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
   const pixivFixers = monitor?.getFixers(guildId, 'pixiv') ?? DEFAULT_PIXIV_FIXERS;
 
   const footer =
-    `Channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}\n` +
+    `Default channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}\n` +
     `X fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}\n` +
     `Pixiv fixers: ${pixivFixers.map((f) => `\`${f}\``).join(' ')}`;
 
@@ -555,6 +572,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     if (group.length === 0) continue;
     const lines = group.map((a) =>
       `\`${a.user_id ?? '?'}\` - ${authorName(a)} — ${configSummary(a)}` +
+      (a.channel_id ? ` → <#${a.channel_id}>` : '') +
       (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
     const label = platform === 'pixiv' ? 'Pixiv' : 'Twitter/X';
     sections.push(`**${label}** (${group.length})`, ...lines);
@@ -569,9 +587,21 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
 
 async function handleChannel(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
   const channel = interaction.options.getChannel('channel', true);
+  const username = interaction.options.getString('username');
+  if (username) {
+    const clean = username.replace(/^@/, '').trim();
+    const author = db.findMonitorAuthorCI(guildId, clean) ?? db.getMonitorAuthor(guildId, clean);
+    if (!author) {
+      await safeEditReply(interaction, `\`${clean}\` is not being monitored in this server.`);
+      return;
+    }
+    db.updateMonitorAuthorChannel(guildId, author.username, channel.id);
+    await safeEditReply(interaction, `**${authorName(author)}** now relays to <#${channel.id}>.`);
+    return;
+  }
   db.setMonitorConfig(guildId, 'target_channel_id', channel.id);
   monitor?.setChannel(guildId, channel.id);
-  await safeEditReply(interaction, `Monitor target channel set to <#${channel.id}>. New posts will be relayed there.`);
+  await safeEditReply(interaction, `Server default relay channel set to <#${channel.id}>. New authors relay there unless bound to their own channel.`);
 }
 
 async function handleFixers(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {

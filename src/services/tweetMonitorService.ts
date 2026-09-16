@@ -37,10 +37,10 @@ export interface MonitorVerifyAllEntry {
   username: string;
   status: 'posted' | 'skipped' | 'identity-mismatch' | 'no-posts' | 'failed' | 'no-channel' | 'duplicate';
   tweetId: string | null;
+  channelId: string | null;
 }
 
 export interface MonitorVerifyAllResult {
-  channelId: string | null;
   entries: MonitorVerifyAllEntry[];
   aborted?: boolean;
 }
@@ -301,8 +301,8 @@ export class TweetMonitorService {
             this.db.updateMonitorAuthorUserId(guildId, existing.username, author.userId);
             await this.confirmAwait(pending, message, `@${existing.username} is already being monitored in this server.`);
           } else {
-            this.db.addMonitorAuthor(guildId, author.screen_name, author.userId);
-            await this.confirmAwait(pending, message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed after that.`);
+            this.db.addMonitorAuthor(guildId, author.screen_name, author.userId, 'twitter', null, message.channelId);
+            await this.confirmAwait(pending, message, `Now monitoring **@${author.screen_name}** (user \`${author.userId}\`). The next poll baselines their timeline; new posts are relayed to <#${message.channelId}> after that.`);
           }
         }
       } catch (err) {
@@ -328,8 +328,8 @@ export class TweetMonitorService {
           if (existing) {
             await this.confirmAwait(pending, message, `${owner.userName} (\`${owner.userId}\`) is already being monitored in this server.`);
           } else {
-            this.db.addMonitorAuthor(guildId, owner.userId, owner.userId, 'pixiv', owner.userName);
-            await this.confirmAwait(pending, message, `Now monitoring pixiv user **${owner.userName}** (\`${owner.userId}\`). The next poll baselines their gallery; new artworks are relayed after that.`);
+            this.db.addMonitorAuthor(guildId, owner.userId, owner.userId, 'pixiv', owner.userName, message.channelId);
+            await this.confirmAwait(pending, message, `Now monitoring pixiv user **${owner.userName}** (\`${owner.userId}\`). The next poll baselines their gallery; new artworks are relayed to <#${message.channelId}> after that.`);
           }
         }
       } catch (err) {
@@ -368,6 +368,10 @@ export class TweetMonitorService {
 
   getChannelId(guildId: string): string | null {
     return this.db.getMonitorConfig(guildId, 'target_channel_id');
+  }
+
+  getAuthorChannel(guildId: string, author: MonitorAuthorRow): string | null {
+    return author.channel_id || this.getChannelId(guildId);
   }
 
   getIntervalMs(guildId: string): number {
@@ -444,7 +448,7 @@ export class TweetMonitorService {
       this.db.updateMonitorAuthorUserId(guildId, author.username, tweetAuthorId);
     }
 
-    const channelId = this.getChannelId(guildId);
+    const channelId = this.getAuthorChannel(guildId, author);
     if (!channelId) return { found: true, tweetId: String(tweet.id), channelId: null, posted: false };
     try {
       const result = await this.relayTweet(tweet, author.username, channelId, guildId);
@@ -463,7 +467,7 @@ export class TweetMonitorService {
     if (illusts.length === 0) return { found: false, tweetId: null, channelId: null, posted: false };
     const illust = illusts[0];
 
-    const channelId = this.getChannelId(guildId);
+    const channelId = this.getAuthorChannel(guildId, author);
     if (!channelId) return { found: true, tweetId: illust.id, channelId: null, posted: false };
     try {
       const result = await this.relayPixivArt(illust.id, author.display_name, channelId, guildId);
@@ -478,16 +482,16 @@ export class TweetMonitorService {
   }
 
   async verifyAll(guildId: string): Promise<MonitorVerifyAllResult> {
-    const channelId = this.getChannelId(guildId);
     const authors = this.db.listMonitorAuthors(guildId);
     const entries: MonitorVerifyAllEntry[] = [];
     this.verifyAllAborted = false;
 
     for (const author of authors) {
       if (this.verifyAllAborted) {
-        return { channelId, entries, aborted: true };
+        return { entries, aborted: true };
       }
-      const entry: MonitorVerifyAllEntry = { username: author.username, status: 'no-posts', tweetId: null };
+      const channelId = this.getAuthorChannel(guildId, author);
+      const entry: MonitorVerifyAllEntry = { username: author.username, status: 'no-posts', tweetId: null, channelId };
       try {
         if (author.platform === 'pixiv') {
           const illusts = await fetchLatestIllusts(author.username);
@@ -532,7 +536,7 @@ export class TweetMonitorService {
       entries.push(entry);
     }
 
-    return { channelId, entries };
+    return { entries };
   }
 
   start(): void {
@@ -591,10 +595,9 @@ export class TweetMonitorService {
     const fetchCache = new Map<string, unknown>();
     try {
       for (const guildId of this.db.listMonitorGuilds()) {
-        const channelId = this.getChannelId(guildId);
         for (const author of this.db.listMonitorAuthors(guildId)) {
           try {
-            await this.pollAuthor(author, guildId, channelId, fetchCache);
+            await this.pollAuthor(author, guildId, this.getAuthorChannel(guildId, author), fetchCache);
           } catch (err) {
             if (this.isNetworkError(err)) {
               if (!networkError) {

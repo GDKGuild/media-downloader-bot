@@ -32,6 +32,7 @@ export interface MonitorAuthorRow {
   user_id: string | null;
   platform: MonitorPlatform;
   display_name: string | null;
+  channel_id: string | null;
   last_tweet_id: string | null;
   last_tweet_ts: number | null;
   active: number;
@@ -210,6 +211,16 @@ export class DatabaseService {
       this.db.exec('ALTER TABLE monitor_authors ADD COLUMN display_name TEXT');
     }
 
+    if (hasTable('monitor_authors') && !columns('monitor_authors').includes('channel_id')) {
+      this.db.exec('ALTER TABLE monitor_authors ADD COLUMN channel_id TEXT');
+      this.db.exec(`
+        UPDATE monitor_authors SET channel_id = (
+          SELECT value FROM monitor_config mc
+          WHERE mc.key = 'target_channel_id' AND mc.guild_id = monitor_authors.guild_id
+        ) WHERE channel_id IS NULL
+      `);
+    }
+
     if (hasTable('monitor_seen_tweets') && !columns('monitor_seen_tweets').includes('guild_id')) {
       this.db.exec('ALTER TABLE monitor_seen_tweets RENAME TO monitor_seen_tweets_old');
       this.db.exec(`
@@ -374,35 +385,35 @@ export class DatabaseService {
 
   listMonitorAuthors(guildId: string): MonitorAuthorRow[] {
     return this.db.prepare(
-      'SELECT username, user_id, platform, display_name, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND active = 1 ORDER BY added_at'
+      'SELECT username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND active = 1 ORDER BY added_at'
     ).all(guildId) as MonitorAuthorRow[];
   }
 
   getMonitorAuthor(guildId: string, username: string): MonitorAuthorRow | null {
     const row = this.db.prepare(
-      'SELECT username, user_id, platform, display_name, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND username = ?'
+      'SELECT username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND username = ?'
     ).get(guildId, username) as MonitorAuthorRow | undefined;
     return row || null;
   }
 
   findMonitorAuthorCI(guildId: string, username: string): MonitorAuthorRow | null {
     const row = this.db.prepare(
-      'SELECT username, user_id, platform, display_name, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND lower(username) = lower(?)'
+      'SELECT username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND lower(username) = lower(?)'
     ).get(guildId, username) as MonitorAuthorRow | undefined;
     return row || null;
   }
 
   findMonitorAuthorByUserId(guildId: string, userId: string): MonitorAuthorRow | null {
     const row = this.db.prepare(
-      'SELECT username, user_id, platform, display_name, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND user_id = ?'
+      'SELECT username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE guild_id = ? AND user_id = ?'
     ).get(guildId, userId) as MonitorAuthorRow | undefined;
     return row || null;
   }
 
-  addMonitorAuthor(guildId: string, username: string, userId: string | null = null, platform: MonitorPlatform = 'twitter', displayName: string | null = null): void {
+  addMonitorAuthor(guildId: string, username: string, userId: string | null = null, platform: MonitorPlatform = 'twitter', displayName: string | null = null, channelId: string | null = null): void {
     this.db.prepare(
-      "INSERT OR IGNORE INTO monitor_authors (guild_id, username, user_id, platform, display_name, active) VALUES (?, ?, ?, ?, ?, 1)"
-    ).run(guildId, username, userId, platform, displayName);
+      "INSERT OR IGNORE INTO monitor_authors (guild_id, username, user_id, platform, display_name, channel_id, active) VALUES (?, ?, ?, ?, ?, ?, 1)"
+    ).run(guildId, username, userId, platform, displayName, channelId);
   }
 
   removeMonitorAuthor(guildId: string, username: string): void {
@@ -424,6 +435,10 @@ export class DatabaseService {
 
   updateMonitorAuthorUserId(guildId: string, username: string, userId: string): void {
     this.db.prepare('UPDATE monitor_authors SET user_id = ? WHERE guild_id = ? AND username = ?').run(userId, guildId, username);
+  }
+
+  updateMonitorAuthorChannel(guildId: string, username: string, channelId: string): void {
+    this.db.prepare('UPDATE monitor_authors SET channel_id = ? WHERE guild_id = ? AND username = ?').run(channelId, guildId, username);
   }
 
   updateMonitorAuthorDisplayName(guildId: string, username: string, displayName: string): void {
