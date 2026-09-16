@@ -11,11 +11,11 @@ const PAGES: HelpPage[] = [
   {
     title: 'Automated Discord Archiver & Monitor',
     description: [
-      'This bot downloads and archives media from your Discord channels, and monitors Twitter/X authors.',
+      'This bot downloads and archives media from your Discord channels, and monitors Twitter/X and Pixiv authors.',
       '',
       '• **Auto-download** — every message with attachments or media embeds is saved automatically, with per-channel dedup so nothing is stored twice.',
       '• **Backfill** — `/download` walks a channel\'s history on demand (with time or date limits) and saves whatever\'s missing.',
-      '• **Monitor** — `/monitor` tracks Twitter/X authors and relays their media posts into your server.',
+      '• **Monitor** — `/monitor` tracks Twitter/X and Pixiv authors and relays their new posts into your server.',
       '• **Media viewer** — browse downloaded files by guild/channel/thread.',
       '• **Storage** — files go to the local downloads folder, an external drive, or MEGA.',
       '',

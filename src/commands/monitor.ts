@@ -549,13 +549,20 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     return;
   }
 
-  const lines = authors.map((a) =>
-    `\`${a.user_id ?? '?'}\` - ${authorName(a)} — ${configSummary(a)}` +
-    (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
+  const sections: string[] = [];
+  for (const platform of ['twitter', 'pixiv'] as const) {
+    const group = authors.filter((a) => a.platform === platform);
+    if (group.length === 0) continue;
+    const lines = group.map((a) =>
+      `\`${a.user_id ?? '?'}\` - ${authorName(a)} — ${configSummary(a)}` +
+      (a.last_tweet_id ? ` · last \`${a.last_tweet_id}\`` : ' · not yet baselined'));
+    const label = platform === 'pixiv' ? 'Pixiv' : 'Twitter/X';
+    sections.push(`**${label}** (${group.length})`, ...lines);
+  }
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(`Monitored authors in this server (${authors.length})`)
-    .setDescription(lines.join('\n'))
+    .setDescription(sections.join('\n'))
     .setFooter({ text: footer });
   await interaction.editReply({ embeds: [embed] });
 }
