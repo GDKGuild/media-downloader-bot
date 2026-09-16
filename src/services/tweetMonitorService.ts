@@ -582,12 +582,13 @@ export class TweetMonitorService {
     if (this.polling) return;
     this.polling = true;
     let networkError = false;
+    const fetchCache = new Map<string, unknown>();
     try {
       for (const guildId of this.db.listMonitorGuilds()) {
         const channelId = this.getChannelId(guildId);
         for (const author of this.db.listMonitorAuthors(guildId)) {
           try {
-            await this.pollAuthor(author, guildId, channelId);
+            await this.pollAuthor(author, guildId, channelId, fetchCache);
           } catch (err) {
             if (this.isNetworkError(err)) {
               if (!networkError) {
@@ -643,12 +644,11 @@ export class TweetMonitorService {
     return hashtags.length === 0 || hasConfiguredHashtag(tweet, hashtags) || hasConfiguredHashtag(parent, hashtags);
   }
 
-  private async fetchStatuses(username: string, author: MonitorAuthorRow): Promise<MonitorTweet[]> {
-    const hashtags = this.loadHashtags();
+  private async fetchRawStatuses(username: string, includeReplies: boolean): Promise<MonitorTweet[]> {
     const res = await axios.get(`${API_BASE}/${encodeURIComponent(username)}/statuses`, {
       params: {
         count: getMonitorPageSize(),
-        ...(author.include_replies ? { with_replies: 1 } : {}),
+        ...(includeReplies ? { with_replies: 1 } : {}),
       },
       timeout: 20000,
       headers: { 'User-Agent': BROWSER_UA, 'Accept': 'application/json' },
@@ -658,8 +658,11 @@ export class TweetMonitorService {
     if (res.status === 404) throw new Error('handle not found');
     const data = res.data as { code?: number; results?: unknown[] } | undefined;
     if (!data || data.code !== 200 || !Array.isArray(data.results)) return [];
-    const tweets = data.results.filter((r): r is MonitorTweet =>
+    return data.results.filter((r): r is MonitorTweet =>
       !!r && typeof r === 'object' && (r as MonitorTweet).type === 'status');
+  }
+
+  private async filterStatuses(tweets: MonitorTweet[], author: MonitorAuthorRow, hashtags: string[]): Promise<MonitorTweet[]> {
     const passed: MonitorTweet[] = [];
     for (const tweet of tweets) {
       if (await this.tweetPassesFilter(tweet, author, hashtags)) passed.push(tweet);
@@ -667,12 +670,18 @@ export class TweetMonitorService {
     return passed;
   }
 
-  private async pollAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
+  private async pollAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null, fetchCache: Map<string, unknown>): Promise<void> {
     if (author.platform === 'pixiv') {
-      await this.pollPixivAuthor(author, guildId, channelId);
+      await this.pollPixivAuthor(author, guildId, channelId, fetchCache);
       return;
     }
-    const tweets = await this.fetchStatuses(author.username, author);
+    const cacheKey = `twitter:${author.username}:${author.include_replies ? 1 : 0}`;
+    let tweets = fetchCache.get(cacheKey) as MonitorTweet[] | undefined;
+    if (!tweets) {
+      tweets = await this.fetchRawStatuses(author.username, !!author.include_replies);
+      fetchCache.set(cacheKey, tweets);
+    }
+    tweets = await this.filterStatuses(tweets, author, this.loadHashtags());
     if (tweets.length === 0) return;
 
     const newest = tweets[0];
@@ -740,8 +749,13 @@ export class TweetMonitorService {
       : `@${author.username}`;
   }
 
-  private async pollPixivAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null): Promise<void> {
-    const illusts = await fetchLatestIllusts(author.username);
+  private async pollPixivAuthor(author: MonitorAuthorRow, guildId: string, channelId: string | null, fetchCache: Map<string, unknown>): Promise<void> {
+    const cacheKey = `pixiv:${author.username}`;
+    let illusts = fetchCache.get(cacheKey) as Awaited<ReturnType<typeof fetchLatestIllusts>> | undefined;
+    if (!illusts) {
+      illusts = await fetchLatestIllusts(author.username);
+      fetchCache.set(cacheKey, illusts);
+    }
     if (illusts.length === 0) return;
 
     const newest = illusts[0];
