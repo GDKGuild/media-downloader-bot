@@ -14,6 +14,7 @@ import { safeEditReply } from '../utils/interactionUtils';
 
 export const MONITOR_VERIFY_SELECT_ID = 'monitor_verify_select';
 export const MONITOR_CONFIG_SELECT_ID = 'monitor_config';
+export const MONITOR_MIGRATE_SELECT_ID = 'monitor_migrate_select';
 
 const CONFIG_STEP_AUTHOR = `${MONITOR_CONFIG_SELECT_ID}:author`;
 const CONFIG_STEP_CONTENT = `${MONITOR_CONFIG_SELECT_ID}:content`;
@@ -110,6 +111,13 @@ export const data = new SlashCommandBuilder()
     sub.setName('list')
       .setDescription('Show monitored authors and settings'))
   .addSubcommand(sub =>
+    sub.setName('migrate')
+      .setDescription('Copy an author + settings from another guild into this one (source keeps monitoring)')
+      .addStringOption(opt =>
+        opt.setName('username')
+          .setDescription('Twitter handle (without @) or pixiv user ID monitored in another guild')
+          .setRequired(true)))
+  .addSubcommand(sub =>
     sub.setName('channel')
       .setDescription('Set the relay channel (server default, or per-author with a username)')
       .addChannelOption(opt =>
@@ -202,6 +210,9 @@ export async function execute(
     case 'list':
       await handleList(interaction, db, monitor, guildId);
       break;
+    case 'migrate':
+      await handleMigrate(interaction, db, monitor, guildId);
+      break;
     case 'channel':
       await handleChannel(interaction, db, monitor, guildId);
       break;
@@ -290,6 +301,121 @@ async function handleAwait(interaction: ChatInputCommandInteraction, monitor: Tw
   }
   monitor.armAwait(guildId, interaction.channelId, interaction.user.id, ms, interaction);
   await safeEditReply(interaction, `Waiting **${formatMs(ms)}** for a link in this server. Paste any \`x.com\` / \`twitter.com\` tweet link or a \`pixiv.net\` / \`phixiv.net\` artwork or user link in any channel — I'll add its author to the monitor.`);
+}
+
+function findDestConflict(db: DatabaseService, guildId: string, candidates: Array<MonitorAuthorRow & { guild_id: string }>): MonitorAuthorRow | null {
+  for (const c of candidates) {
+    if (c.user_id) {
+      const byId = db.findMonitorAuthorByUserId(guildId, c.user_id);
+      if (byId) return byId;
+    }
+  }
+  for (const c of candidates) {
+    const byName = db.findMonitorAuthorCI(guildId, c.username);
+    if (byName) return byName;
+  }
+  return null;
+}
+
+function performMigrate(db: DatabaseService, monitor: TweetMonitorService, guildId: string, source: MonitorAuthorRow, sourceGuildId: string, channelId: string): string {
+  db.cloneMonitorAuthor(guildId, source, channelId);
+  const guildLabel = monitor.getGuildName(sourceGuildId) ?? sourceGuildId;
+  const cursorNote = source.last_tweet_id ? ` (last \`${source.last_tweet_id}\`)` : '';
+  return `Migrated **${authorName(source)}** from **${guildLabel}** — config and poll cursor copied${cursorNote}.\nRelaying to <#${channelId}>. The first poll catches up anything newer than the cursor; new posts relay here from then on. **${guildLabel} still monitors them too.**`;
+}
+
+async function handleMigrate(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
+  if (!monitor) {
+    await safeEditReply(interaction, 'The monitor service is not available.');
+    return;
+  }
+  const raw = interaction.options.getString('username', true);
+  const clean = raw.replace(/^@/, '').trim();
+  if (!clean) {
+    await safeEditReply(interaction, `Invalid username \`${raw}\`.`);
+    return;
+  }
+
+  let candidates = db.findMonitorAuthorsGlobalByUserId(clean);
+  if (candidates.length === 0) candidates = db.findMonitorAuthorsGlobalCI(clean);
+  candidates = candidates.filter((c) => c.guild_id !== guildId && monitor.getGuildName(c.guild_id) !== null);
+  if (candidates.length === 0) {
+    await safeEditReply(interaction, `\`${clean}\` is not monitored in any other guild the bot can see. Use \`/monitor add\` to add it here from scratch.`);
+    return;
+  }
+
+  const conflict = findDestConflict(db, guildId, candidates);
+  if (conflict) {
+    await safeEditReply(interaction, `${authorName(conflict)} is already being monitored here${bindingText(db, guildId, conflict)}. Nothing to migrate.`);
+    return;
+  }
+
+  if (candidates.length === 1) {
+    await safeEditReply(interaction, performMigrate(db, monitor, guildId, candidates[0], candidates[0].guild_id, interaction.channelId));
+    return;
+  }
+
+  const options = candidates.slice(0, 25).map((c) => {
+    const guild = monitor.getGuildName(c.guild_id) ?? c.guild_id;
+    const row = db.getMonitorAuthor(c.guild_id, c.username);
+    const name = row ? authorName(row) : `${c.platform === 'pixiv' ? '' : '@'}${c.username}`;
+    const detail = row?.channel_id
+      ? ' · bound to a channel'
+      : (row?.last_tweet_id ? ` · last \`${row.last_tweet_id}\`` : ' · not baselined');
+    return { label: guild, value: `${c.guild_id}:${c.username}`, description: `${name}${detail}` };
+  });
+  const row = makeSelectRow(MONITOR_MIGRATE_SELECT_ID, 'Choose the source guild', options);
+  await interaction.editReply({
+    content: `**Migrate \`${clean}\` — monitored in ${candidates.length} other guilds. Pick the source to clone into this server:**`,
+    components: [row],
+  });
+}
+
+export async function handleMigrateSelect(
+  interaction: StringSelectMenuInteraction,
+  db: DatabaseService,
+  monitor: TweetMonitorService | undefined,
+): Promise<void> {
+  const guildId = interaction.guildId;
+  const selected = interaction.values[0];
+  if (!guildId || !selected) return;
+  const sep = selected.indexOf(':');
+  if (sep === -1) return;
+  const sourceGuildId = selected.slice(0, sep);
+  const sourceUsername = selected.slice(sep + 1);
+
+  try {
+    await interaction.deferUpdate();
+    if (!monitor) {
+      await interaction.editReply('The monitor service is not available.');
+      return;
+    }
+    const source = db.getMonitorAuthor(sourceGuildId, sourceUsername);
+    if (!source) {
+      await interaction.editReply({ content: 'That author is no longer monitored in the selected guild.', components: [] });
+      return;
+    }
+    const conflict = (source.user_id && db.findMonitorAuthorByUserId(guildId, source.user_id))
+      || db.findMonitorAuthorCI(guildId, source.username);
+    if (conflict) {
+      await interaction.editReply({
+        content: `${authorName(conflict)} is already being monitored here${bindingText(db, guildId, conflict)}. Nothing to migrate.`,
+        components: [],
+      });
+      return;
+    }
+    await interaction.editReply({
+      content: performMigrate(db, monitor, guildId, source, sourceGuildId, interaction.channelId),
+      components: [],
+    });
+  } catch (err) {
+    const e = err as { code?: number } | undefined;
+    if (e && typeof e === 'object' && e.code === 10062) {
+      console.log('[Monitor] migrate select: interaction expired or already handled (10062) — ignored');
+    } else {
+      console.error(`[Monitor] migrate select failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 }
 
 async function handleRemove(interaction: ChatInputCommandInteraction, db: DatabaseService, guildId: string): Promise<void> {

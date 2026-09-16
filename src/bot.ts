@@ -12,7 +12,7 @@ import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
 import { execute as deleteCommandExecute } from './commands/delete';
 import { execute as monitorCommandExecute } from './commands/monitor';
-import { handleVerifySelect, handleConfigSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID } from './commands/monitor';
+import { handleVerifySelect, handleConfigSelect, handleMigrateSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID, MONITOR_MIGRATE_SELECT_ID } from './commands/monitor';
 import { execute as helpCommandExecute, handleHelpButton, HELP_PAGE_PREFIX } from './commands/help';
 import { handleMessageCreate } from './events/messageCreate';
 
@@ -150,6 +150,15 @@ export function createBot(): Client {
         await handleVerifySelect(interaction, db, tweetMonitor);
       } catch (error) {
         logInteractionError('monitor verify select', error);
+      }
+      return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === MONITOR_MIGRATE_SELECT_ID) {
+      try {
+        await handleMigrateSelect(interaction, db, tweetMonitor);
+      } catch (error) {
+        logInteractionError('monitor migrate select', error);
       }
       return;
     }

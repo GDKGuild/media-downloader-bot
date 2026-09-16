@@ -374,6 +374,10 @@ export class TweetMonitorService {
     return author.channel_id || this.getChannelId(guildId);
   }
 
+  getGuildName(guildId: string): string | null {
+    return this.client.guilds.cache.get(guildId)?.name ?? null;
+  }
+
   getIntervalMs(guildId: string): number {
     let raw = this.db.getMonitorConfig(guildId, 'poll_interval_ms');
     if (raw == null) {

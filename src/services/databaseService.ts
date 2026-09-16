@@ -410,10 +410,35 @@ export class DatabaseService {
     return row || null;
   }
 
+  findMonitorAuthorsGlobalByUserId(userId: string): Array<MonitorAuthorRow & { guild_id: string }> {
+    return this.db.prepare(
+      'SELECT guild_id, username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE user_id = ?'
+    ).all(userId) as Array<MonitorAuthorRow & { guild_id: string }>;
+  }
+
+  findMonitorAuthorsGlobalCI(username: string): Array<MonitorAuthorRow & { guild_id: string }> {
+    return this.db.prepare(
+      'SELECT guild_id, username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active, added_at, include_posts, include_replies, include_reposts, media_only, hashtag_filter FROM monitor_authors WHERE lower(username) = lower(?)'
+    ).all(username) as Array<MonitorAuthorRow & { guild_id: string }>;
+  }
+
   addMonitorAuthor(guildId: string, username: string, userId: string | null = null, platform: MonitorPlatform = 'twitter', displayName: string | null = null, channelId: string | null = null): void {
     this.db.prepare(
       "INSERT OR IGNORE INTO monitor_authors (guild_id, username, user_id, platform, display_name, channel_id, active) VALUES (?, ?, ?, ?, ?, ?, 1)"
     ).run(guildId, username, userId, platform, displayName, channelId);
+  }
+
+  cloneMonitorAuthor(destGuildId: string, source: MonitorAuthorRow, channelId: string | null): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO monitor_authors
+        (guild_id, username, user_id, platform, display_name, channel_id, last_tweet_id, last_tweet_ts, active,
+         include_posts, include_replies, include_reposts, media_only, hashtag_filter)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+    `).run(
+      destGuildId, source.username, source.user_id, source.platform, source.display_name, channelId,
+      source.last_tweet_id, source.last_tweet_ts,
+      source.include_posts, source.include_replies, source.include_reposts, source.media_only, source.hashtag_filter,
+    );
   }
 
   removeMonitorAuthor(guildId: string, username: string): void {
