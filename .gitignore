@@ -15,3 +15,4 @@ graphify-out/
 add-timestamps-report.*
 *.ps1
 *.jsonl
+bootstrap-pixiv.py
