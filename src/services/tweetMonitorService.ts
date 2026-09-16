@@ -541,9 +541,15 @@ export class TweetMonitorService {
     this.timer = setInterval(() => {
       void this.poll();
     }, this.getEffectiveIntervalMs());
-    const authorCount = this.db.listMonitorGuilds()
-      .reduce((sum, guildId) => sum + this.db.listMonitorAuthors(guildId).length, 0);
-    console.log(`[Monitor] Started (${formatMs(this.getEffectiveIntervalMs())} interval, ${authorCount} author(s))`);
+    const guilds = this.db.listMonitorGuilds();
+    const uniqueAuthors = new Set<string>();
+    for (const guildId of guilds) {
+      for (const author of this.db.listMonitorAuthors(guildId)) {
+        uniqueAuthors.add(`${author.platform}:${(author.user_id ?? author.username).toLowerCase()}`);
+      }
+    }
+    const authorCount = guilds.reduce((sum, guildId) => sum + this.db.listMonitorAuthors(guildId).length, 0);
+    console.log(`[Monitor] Started (${formatMs(this.getEffectiveIntervalMs())} interval, ${uniqueAuthors.size} unique author(s), ${authorCount} entries across ${guilds.length} guild(s))`);
   }
 
   stop(): void {
