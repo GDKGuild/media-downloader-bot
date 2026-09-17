@@ -703,12 +703,32 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     const label = platform === 'pixiv' ? 'Pixiv' : 'Twitter/X';
     sections.push(`**${label}** (${group.length})`, ...lines);
   }
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle(`Monitored authors in this server (${authors.length})`)
-    .setDescription(sections.join('\n'))
-    .setFooter({ text: footer });
-  await interaction.editReply({ embeds: [embed] });
+
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let length = 0;
+  for (const line of sections) {
+    const addition = (current.length > 0 ? 1 : 0) + line.length;
+    if (current.length > 0 && length + addition > 4096) {
+      chunks.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(line);
+    length += addition;
+  }
+  if (current.length > 0) chunks.push(current);
+
+  const title = `Monitored authors in this server (${authors.length})`;
+  const embeds = chunks.map((chunk, i) => {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle(chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title)
+      .setDescription(chunk.join('\n'));
+    if (i === chunks.length - 1) embed.setFooter({ text: footer });
+    return embed;
+  });
+  await interaction.editReply({ embeds });
 }
 
 async function handleChannel(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
