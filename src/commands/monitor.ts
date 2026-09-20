@@ -79,6 +79,34 @@ function makeSelectRow(
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
 }
 
+function chunkLines(lines: string[], max: number): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let length = 0;
+  for (const line of lines) {
+    const addition = (current.length > 0 ? 1 : 0) + line.length;
+    if (current.length > 0 && length + addition > max) {
+      chunks.push(current);
+      current = [];
+      length = 0;
+    }
+    current.push(line);
+    length += addition;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+async function sendEmbeds(interaction: ChatInputCommandInteraction, embeds: EmbedBuilder[]): Promise<void> {
+  const batches: EmbedBuilder[][] = [];
+  for (let i = 0; i < embeds.length; i += 10) batches.push(embeds.slice(i, i + 10));
+  const [first, ...rest] = batches;
+  await interaction.editReply({ embeds: first });
+  for (const batch of rest) {
+    await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
+  }
+}
+
 export const data = new SlashCommandBuilder()
   .setName('monitor')
   .setDescription('Manage social media author monitoring')
@@ -667,11 +695,14 @@ async function handleVerifyAll(
     }
   });
   const header = result.aborted
-    ? `**Verify all aborted by /cancel** (${result.entries.length} author(s) processed before stop)`
-    : `**Verify all (${result.entries.length} tracked)**`;
-  await safeEditReply(interaction,
-    header + '\n' +
-    lines.join('\n'));
+    ? `Verify all aborted by /cancel (${result.entries.length} author(s) processed before stop)`
+    : `Verify all (${result.entries.length} tracked)`;
+  const chunks = chunkLines(lines, 4096);
+  const embeds = chunks.map((chunk, i) => new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(chunks.length > 1 ? `${header} (${i + 1}/${chunks.length})` : header)
+    .setDescription(chunk.join('\n')));
+  await sendEmbeds(interaction, embeds);
 }
 
 async function handleList(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
@@ -704,21 +735,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     sections.push(`**${label}** (${group.length})`, ...lines);
   }
 
-  const chunks: string[][] = [];
-  let current: string[] = [];
-  let length = 0;
-  for (const line of sections) {
-    const addition = (current.length > 0 ? 1 : 0) + line.length;
-    if (current.length > 0 && length + addition > 4096) {
-      chunks.push(current);
-      current = [];
-      length = 0;
-    }
-    current.push(line);
-    length += addition;
-  }
-  if (current.length > 0) chunks.push(current);
-
+  const chunks = chunkLines(sections, 4096);
   const title = `Monitored authors in this server (${authors.length})`;
   const embeds = chunks.map((chunk, i) => {
     const embed = new EmbedBuilder()
@@ -728,7 +745,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     if (i === chunks.length - 1) embed.setFooter({ text: footer });
     return embed;
   });
-  await interaction.editReply({ embeds });
+  await sendEmbeds(interaction, embeds);
 }
 
 async function handleChannel(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
