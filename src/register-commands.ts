@@ -45,11 +45,11 @@ const rest = new REST({ version: '10' }).setToken(token);
 
       const guilds = (await rest.get(Routes.userGuilds())) as { id: string }[];
       for (const guild of guilds) {
-        const existing = (await rest.get(Routes.applicationGuildCommands(clientId, guild.id))) as unknown[];
-        if (existing.length > 0) {
-          await rest.put(Routes.applicationGuildCommands(clientId, guild.id), { body: [] });
-          console.log(`Cleared stale guild commands in ${guild.id}`);
-        }
+        await rest.put(
+          Routes.applicationGuildCommands(clientId, guild.id),
+          { body: commands }
+        );
+        console.log(`Registered ${commands.length} commands in guild ${guild.id} (instant, bypasses global propagation)`);
       }
     }
   } catch (error) {
