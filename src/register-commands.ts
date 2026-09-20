@@ -26,24 +26,31 @@ const rest = new REST({ version: '10' }).setToken(token);
   try {
     console.log('Registering slash commands...');
 
-    await rest.put(Routes.applicationCommands(clientId), { body: [] });
-    console.log('Cleared global commands (guild-scoped only — avoids global/guild duplicates)');
-
-    let targets = guildIds;
-    if (targets.length === 0) {
-      const guilds = (await rest.get(Routes.userGuilds())) as { id: string }[];
-      targets = guilds.map((g) => g.id);
-    }
-    if (targets.length === 0) {
-      console.log('No guilds to register into.');
-      return;
-    }
-    for (const guildId of targets) {
+    if (guildIds.length > 0) {
+      await rest.put(Routes.applicationCommands(clientId), { body: [] });
+      console.log('Cleared global commands');
+      for (const guildId of guildIds) {
+        await rest.put(
+          Routes.applicationGuildCommands(clientId, guildId),
+          { body: commands }
+        );
+        console.log(`Registered ${commands.length} commands for guild ${guildId}`);
+      }
+    } else {
       await rest.put(
-        Routes.applicationGuildCommands(clientId, guildId),
+        Routes.applicationCommands(clientId),
         { body: commands }
       );
-      console.log(`Registered ${commands.length} commands in guild ${guildId}`);
+      console.log(`Registered ${commands.length} global commands`);
+
+      const guilds = (await rest.get(Routes.userGuilds())) as { id: string }[];
+      for (const guild of guilds) {
+        const existing = (await rest.get(Routes.applicationGuildCommands(clientId, guild.id))) as unknown[];
+        if (existing.length > 0) {
+          await rest.put(Routes.applicationGuildCommands(clientId, guild.id), { body: [] });
+          console.log(`Cleared stale guild commands in ${guild.id}`);
+        }
+      }
     }
   } catch (error) {
     console.error('Failed to register commands:', error);
