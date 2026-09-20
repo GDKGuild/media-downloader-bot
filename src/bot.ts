@@ -11,6 +11,7 @@ import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
 import { execute as deleteCommandExecute } from './commands/delete';
+import { execute as editCommandExecute } from './commands/edit';
 import { execute as monitorCommandExecute } from './commands/monitor';
 import { handleVerifySelect, handleConfigSelect, handleMigrateSelect, MONITOR_VERIFY_SELECT_ID, MONITOR_CONFIG_SELECT_ID, MONITOR_MIGRATE_SELECT_ID } from './commands/monitor';
 import { execute as helpCommandExecute, handleHelpButton, HELP_PAGE_PREFIX } from './commands/help';
@@ -203,6 +204,12 @@ export function createBot(): Client {
         await deleteCommandExecute(interaction);
       } catch (error) {
         logInteractionError('delete', error);
+      }
+    } else if (interaction.commandName === 'edit') {
+      try {
+        await editCommandExecute(interaction);
+      } catch (error) {
+        logInteractionError('edit', error);
       }
     } else if (interaction.commandName === 'monitor') {
       try {
