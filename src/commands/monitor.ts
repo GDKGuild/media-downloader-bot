@@ -97,6 +97,16 @@ function chunkLines(lines: string[], max: number): string[][] {
   return chunks;
 }
 
+const EMBED_TOTAL_MAX = 6000;
+const DESCRIPTION_MAX = 4096;
+const TITLE_MAX = 256;
+const FOOTER_MAX = 2048;
+
+function descriptionBudget(...overhead: number[]): number {
+  const used = overhead.reduce((n, len) => n + len, 0);
+  return Math.min(DESCRIPTION_MAX, Math.max(256, EMBED_TOTAL_MAX - used - 16));
+}
+
 async function sendEmbeds(interaction: ChatInputCommandInteraction, embeds: EmbedBuilder[]): Promise<void> {
   const batches: EmbedBuilder[][] = [];
   for (let i = 0; i < embeds.length; i += 10) batches.push(embeds.slice(i, i + 10));
@@ -697,7 +707,7 @@ async function handleVerifyAll(
   const header = result.aborted
     ? `Verify all aborted by /cancel (${result.entries.length} author(s) processed before stop)`
     : `Verify all (${result.entries.length} tracked)`;
-  const chunks = chunkLines(lines, 4096);
+  const chunks = chunkLines(lines, descriptionBudget(TITLE_MAX));
   const embeds = chunks.map((chunk, i) => new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle(chunks.length > 1 ? `${header} (${i + 1}/${chunks.length})` : header)
@@ -712,10 +722,11 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
   const fixers = monitor?.getFixers(guildId) ?? DEFAULT_FIXERS;
   const pixivFixers = monitor?.getFixers(guildId, 'pixiv') ?? DEFAULT_PIXIV_FIXERS;
 
-  const footer =
-    `Default channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}\n` +
-    `X fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}\n` +
-    `Pixiv fixers: ${pixivFixers.map((f) => `\`${f}\``).join(' ')}`;
+  const footer = [
+    `Default channel: ${channel ? `<#${channel}>` : 'not set'} · Interval: ${formatMs(interval)}`,
+    `X fixers: ${fixers.map((f) => `\`${f}\``).join(' ')}`,
+    `Pixiv fixers: ${pixivFixers.map((f) => `\`${f}\``).join(' ')}`,
+  ].join('\n').slice(0, FOOTER_MAX - 1) + '…';
 
   if (authors.length === 0) {
     await safeEditReply(interaction,
@@ -735,7 +746,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     sections.push(`**${label}** (${group.length})`, ...lines);
   }
 
-  const chunks = chunkLines(sections, 4096);
+  const chunks = chunkLines(sections, descriptionBudget(TITLE_MAX, footer.length));
   const title = `Monitored authors in this server (${authors.length})`;
   const embeds = chunks.map((chunk, i) => {
     const embed = new EmbedBuilder()
