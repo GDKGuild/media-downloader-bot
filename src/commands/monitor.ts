@@ -4,6 +4,8 @@ import {
   StringSelectMenuBuilder,
   StringSelectMenuInteraction,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   MessageFlags,
   EmbedBuilder,
 } from 'discord.js';
@@ -111,14 +113,43 @@ function descriptionBudget(...overhead: number[]): number {
   return Math.min(DESCRIPTION_MAX, Math.max(256, EMBED_TOTAL_MAX - used - 16));
 }
 
-async function sendEmbeds(interaction: ChatInputCommandInteraction, embeds: EmbedBuilder[]): Promise<void> {
-  const batches: EmbedBuilder[][] = [];
-  for (let i = 0; i < embeds.length; i += 10) batches.push(embeds.slice(i, i + 10));
-  const [first, ...rest] = batches;
-  await interaction.editReply({ embeds: first });
-  for (const batch of rest) {
-    await interaction.followUp({ embeds: batch, flags: MessageFlags.Ephemeral });
-  }
+const PAGINATION_MS = 300_000;
+
+async function paginate(interaction: ChatInputCommandInteraction, pages: EmbedBuilder[]): Promise<void> {
+  let page = 0;
+  const row = (): ActionRowBuilder<ButtonBuilder> => new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId('monitor_page_prev')
+      .setLabel('◀ Previous')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page === 0),
+    new ButtonBuilder()
+      .setCustomId('monitor_page_next')
+      .setLabel('Next ▶')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= pages.length - 1),
+  );
+
+  const message = await interaction.editReply({ embeds: [pages[page]], components: [row()] });
+  if (pages.length === 1) return;
+
+  const collector = message.createMessageComponentCollector({ time: PAGINATION_MS });
+  collector.on('collect', async button => {
+    if (button.user.id !== interaction.user.id) {
+      await button.reply({ content: 'Use your own `/monitor` command to page through this.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const next = page + (button.customId === 'monitor_page_next' ? 1 : -1);
+    page = Math.max(0, Math.min(next, pages.length - 1));
+    await button.update({ embeds: [pages[page]], components: [row()] });
+  });
+  collector.on('end', async () => {
+    try {
+      await message.edit({ embeds: [pages[page]], components: [] });
+    } catch (error) {
+      console.warn('[Commands] /monitor: failed to clear pagination buttons:', error);
+    }
+  });
 }
 
 export const data = new SlashCommandBuilder()
@@ -716,7 +747,7 @@ async function handleVerifyAll(
     .setColor(0x5865f2)
     .setTitle(chunks.length > 1 ? `${header} (${i + 1}/${chunks.length})` : header)
     .setDescription(chunk.join('\n')));
-  await sendEmbeds(interaction, embeds);
+  await paginate(interaction, embeds);
 }
 
 async function handleList(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
@@ -760,7 +791,7 @@ async function handleList(interaction: ChatInputCommandInteraction, db: Database
     if (i === chunks.length - 1) embed.setFooter({ text: footer });
     return embed;
   });
-  await sendEmbeds(interaction, embeds);
+  await paginate(interaction, embeds);
 }
 
 async function handleChannel(interaction: ChatInputCommandInteraction, db: DatabaseService, monitor: TweetMonitorService | undefined, guildId: string): Promise<void> {
