@@ -7,6 +7,7 @@ import { formatBytes } from '../utils/mediaUtils';
 import { safeEditReply } from '../utils/interactionUtils';
 import { MediaConfig } from '../types';
 import { resetCancel, resetGlobalCancel } from '../services/cancelManager';
+import { SessionLogger } from '../utils/sessionLogger';
 
 export const data = new SlashCommandBuilder()
   .setName('download')
@@ -502,6 +503,7 @@ export async function execute(
 
       await reportStatus(`${prefix}#${channelName}: ${allMessages.length} messages with ${totalMediaCount} media files. Downloading...`);
 
+      const logger = new SessionLogger(guildName, channelName, 'download');
       try {
         const result = await downloadService.downloadAllMedia(
           allMessages,
@@ -513,6 +515,7 @@ export async function execute(
           (msg) => throttledStatus(`${prefix}${msg}`),
           parentChannelName,
           concurrency,
+          logger,
           targetChannels.length > 1,
           resolvedBaseDir,
         );
@@ -527,6 +530,7 @@ export async function execute(
           db.updateChannelState(guildId, channelId, minId, maxId, sGuild, sChannel, sParent);
         }
 
+        logger.close(`#${channelName}: ${result.mediaCount} files, ${formatBytes(result.totalBytes)}`);
         return {
           messages: allMessages.length,
           media: result.mediaCount,
@@ -536,6 +540,7 @@ export async function execute(
           megaBasePath: result.megaBasePath,
         };
       } catch (error) {
+        logger.close(`Error: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
       }
     } catch (error) {

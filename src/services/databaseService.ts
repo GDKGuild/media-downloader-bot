@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import { cdnUrlPath } from '../utils/mediaUtils';
 
 export interface ChannelState {
   oldest_message_id: string | null;
@@ -145,6 +146,7 @@ export class DatabaseService {
     `);
 
     this.migrateMonitorTables();
+    this.migrateFileHashUrls();
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_monitor_seen_guild_username_ts
@@ -255,6 +257,49 @@ export class DatabaseService {
         SELECT '', key, value FROM monitor_config_old
       `);
       this.db.exec('DROP TABLE monitor_config_old');
+    }
+  }
+
+  // Converts legacy full signed Discord CDN URLs to bare pathnames so hasFileUrl's
+  // exact-equality lookup matches. Restricted to the two CDN hosts: converting an
+  // arbitrary host would leave a bare pathname that could false-match a real CDN
+  // path and skip a download. Self-guarding — once no CDN row holds a full URL the
+  // first batch is empty. Batched by rowid to bound memory, and each batch selects
+  // fully before updating so the scan never mutates the table mid-iteration.
+  private migrateFileHashUrls(): void {
+    const select = this.db.prepare(
+      `SELECT rowid, url FROM file_hashes
+       WHERE (url LIKE 'https://cdn.discordapp.com/%' OR url LIKE 'https://media.discordapp.net/%')
+         AND rowid > ?
+       ORDER BY rowid LIMIT 5000`
+    );
+    const update = this.db.prepare('UPDATE file_hashes SET url = ? WHERE rowid = ?');
+    let cursor = 0;
+    let migrated = 0;
+    let unparseable = 0;
+
+    this.db.transaction(() => {
+      for (;;) {
+        const batch = select.all(cursor) as { rowid: number; url: string }[];
+        if (batch.length === 0) break;
+        for (const row of batch) {
+          const pathname = cdnUrlPath(row.url);
+          if (pathname === null) {
+            unparseable++;
+          } else {
+            update.run(pathname, row.rowid);
+            migrated++;
+          }
+        }
+        cursor = batch[batch.length - 1].rowid;
+      }
+    })();
+
+    if (migrated > 0 || unparseable > 0) {
+      console.log(
+        `[DB] Migrated ${migrated} file_hashes URLs to pathnames` +
+        (unparseable > 0 ? `, ${unparseable} unparseable (left as-is)` : '')
+      );
     }
   }
 

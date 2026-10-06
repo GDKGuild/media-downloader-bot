@@ -185,12 +185,25 @@ export function extractMediaFromMessage(msg: Message, index: number, mediaConfig
   return entries;
 }
 
+const DISCORD_CDN_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+
 export function isDiscordCdnUrl(url: string): boolean {
   try {
-    const host = new URL(url).hostname;
-    return host === 'cdn.discordapp.com' || host === 'media.discordapp.net';
+    return DISCORD_CDN_HOSTS.has(new URL(url).hostname);
   } catch {
     return false;
+  }
+}
+
+// Pathname only: collapses the cdn/media host pair and drops expiring ?ex= signatures.
+// Deliberately restricted to Discord CDN hosts — arbitrary hosts share pathnames
+// (/img/1.jpg), so a global pathname index would false-skip distinct files.
+export function cdnUrlPath(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    return DISCORD_CDN_HOSTS.has(parsed.hostname) ? parsed.pathname : null;
+  } catch {
+    return null;
   }
 }
 
