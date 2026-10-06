@@ -83,17 +83,21 @@ function chunkLines(lines: string[], max: number): string[][] {
   const chunks: string[][] = [];
   let current: string[] = [];
   let length = 0;
+  const flush = (): void => {
+    if (current.length === 0) return;
+    chunks.push(current);
+    current = [];
+    length = 0;
+  };
   for (const line of lines) {
-    const addition = (current.length > 0 ? 1 : 0) + line.length;
-    if (current.length > 0 && length + addition > max) {
-      chunks.push(current);
-      current = [];
-      length = 0;
+    const pieces = line.length <= max ? [line] : line.match(new RegExp(`.{1,${max}}`, 'g')) ?? [line];
+    for (const piece of pieces) {
+      if (length + (current.length > 0 ? 1 : 0) + piece.length > max) flush();
+      current.push(piece);
+      length += piece.length + (current.length > 1 ? 1 : 0);
     }
-    current.push(line);
-    length += addition;
   }
-  if (current.length > 0) chunks.push(current);
+  flush();
   return chunks;
 }
 
