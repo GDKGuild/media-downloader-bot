@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'child_process';
+import { finalizeQueue, isolateQueue } from '../utils/migrationQueue';
 
 interface MigrationEntry {
   relativePath: string;
@@ -108,9 +109,9 @@ export class StorageService {
     return this.listQueue().length;
   }
 
-  private listQueue(): MigrationEntry[] {
-    if (!fs.existsSync(this.queuePath)) return [];
-    return fs.readFileSync(this.queuePath, 'utf-8').split('\n')
+  private listQueue(queuePath: string = this.queuePath): MigrationEntry[] {
+    if (!fs.existsSync(queuePath)) return [];
+    return fs.readFileSync(queuePath, 'utf-8').split('\n')
       .filter(Boolean)
       .map(line => { try { return JSON.parse(line) as MigrationEntry; } catch { return null; } })
       .filter((e): e is MigrationEntry => e !== null);
@@ -119,11 +120,16 @@ export class StorageService {
   async migrateToPrimary(): Promise<{ moved: number; failed: number }> {
     if (!this.available) return { moved: 0, failed: 0 };
 
-    const entries = this.listQueue();
-    if (entries.length === 0) return { moved: 0, failed: 0 };
+    const processingPath = isolateQueue(this.queuePath);
+    const entries = this.listQueue(processingPath ?? this.queuePath);
+    if (entries.length === 0) {
+      finalizeQueue(processingPath, this.queuePath, new Set());
+      return { moved: 0, failed: 0 };
+    }
 
     let moved = 0;
     let failed = 0;
+    const failedPaths = new Set<string>();
 
     for (const entry of entries) {
       try {
@@ -131,7 +137,12 @@ export class StorageService {
         const dest = path.join(this.primaryPath, entry.relativePath);
 
         if (!fs.existsSync(source)) {
-          failed++;
+          if (fs.existsSync(dest)) {
+            moved++;
+          } else {
+            failed++;
+            failedPaths.add(entry.relativePath);
+          }
           continue;
         }
 
@@ -163,16 +174,20 @@ export class StorageService {
             fs.unlinkSync(source);
             this.cleanupEmptyDirs(path.dirname(source), this.fallbackPath);
             moved++;
+          } else if (fs.existsSync(dest)) {
+            moved++;
           } else {
             failed++;
+            failedPaths.add(entry.relativePath);
           }
         } catch {
           failed++;
+          failedPaths.add(entry.relativePath);
         }
       }
     }
 
-    try { fs.unlinkSync(this.queuePath); } catch {}
+    finalizeQueue(processingPath, this.queuePath, failedPaths);
     return { moved, failed };
   }
 

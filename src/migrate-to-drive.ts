@@ -1,6 +1,7 @@
 import { config } from 'dotenv';
 import * as fs from 'fs';
 import * as path from 'path';
+import { finalizeQueue, isolateQueue } from './utils/migrationQueue';
 
 config();
 
@@ -51,6 +52,7 @@ function formatSize(bytes: number): string {
 async function main() {
   console.log('External Drive Migration Script');
   console.log('─'.repeat(50));
+  console.log('Note: stop the bot first — it shares the migration queue with this script.');
 
   if (!DRIVE_PATH) {
     console.error('EXTERNAL_DRIVE_PATH not set in .env');
@@ -67,9 +69,13 @@ async function main() {
     process.exit(1);
   }
 
+  const queuePath = path.resolve(DOWNLOADS_DIR, '..', '.migration-queue.jsonl');
+  const processingPath = isDryRun ? null : isolateQueue(queuePath);
+
   const files = scanFiles(DOWNLOADS_DIR);
   if (files.length === 0) {
     console.log(`\nNo files found in ${DOWNLOADS_DIR}`);
+    finalizeQueue(processingPath, queuePath, new Set());
     process.exit(0);
   }
 
@@ -77,7 +83,7 @@ async function main() {
   console.log(`\nFound ${files.length} files (${formatSize(totalSize)})`);
 
   if (isDryRun) {
-    console.log('\nDry-run mode (use --delete to actually migrate):');
+    console.log('\nDry-run mode — nothing will be copied:');
     for (const file of files.slice(0, 20)) {
       const destPath = path.join(driveRoot, file.relativePath);
       console.log(`  ${file.relativePath}`);
@@ -86,13 +92,14 @@ async function main() {
     if (files.length > 20) {
       console.log(`  ... and ${files.length - 20} more files`);
     }
-    console.log(`\nRun with --delete to move files (delete originals on success).`);
+    console.log(`\nRun without --dry-run to copy files; add --delete to remove originals after a verified copy.`);
     return;
   }
 
   let copied = 0;
   let skipped = 0;
   let failed = 0;
+  const failedPaths = new Set<string>();
 
   for (const file of files) {
     const destPath = path.join(driveRoot, file.relativePath);
@@ -114,6 +121,15 @@ async function main() {
       fs.mkdirSync(destDir, { recursive: true });
 
       fs.copyFileSync(file.localPath, destPath);
+
+      const destFd = fs.openSync(destPath, 'r+');
+      try { fs.fsyncSync(destFd); } finally { fs.closeSync(destFd); }
+
+      const verifiedSize = fs.statSync(destPath).size;
+      if (verifiedSize !== file.size) {
+        throw new Error(`size mismatch after copy: expected ${file.size}, got ${verifiedSize}`);
+      }
+
       if (shouldDelete) {
         fs.unlinkSync(file.localPath);
       }
@@ -124,6 +140,7 @@ async function main() {
       // Clean up partial copy on failure
       try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch {}
       failed++;
+      failedPaths.add(file.relativePath);
       const msg = err instanceof Error ? err.message : String(err);
       process.stdout.write(`\n  FAIL: ${file.relativePath} — ${msg}`);
     }
@@ -131,11 +148,11 @@ async function main() {
 
   console.log(`\n\nDone: ${copied} copied, ${skipped} skipped, ${failed} failed`);
 
-  // Clean up migration queue if it exists
-  const queuePath = path.resolve(DOWNLOADS_DIR, '..', '.migration-queue.jsonl');
-  if (fs.existsSync(queuePath) && failed === 0) {
-    fs.unlinkSync(queuePath);
-    console.log('Migration queue cleared.');
+  if (processingPath && fs.existsSync(processingPath)) {
+    finalizeQueue(processingPath, queuePath, failedPaths);
+    console.log(failedPaths.size === 0
+      ? 'Migration queue cleared.'
+      : `Migration queue kept ${failedPaths.size} failed entr${failedPaths.size === 1 ? 'y' : 'ies'} for retry.`);
   }
 }
 
