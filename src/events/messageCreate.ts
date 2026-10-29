@@ -18,7 +18,10 @@ export async function handleMessageCreate(
   const isOwnRelay = message.author.bot
     && message.author.id === message.client.user?.id
     && /https?:\/\/[^\s]+\/status\/\d+/i.test(message.content);
-  if (message.author.bot && !isOwnRelay && !ALLOWED_BOT_IDS.has(message.author.id)) return;
+  // Webhook posts are never filtered: relay bots (C.A.I.N.) post as a webhook
+  // that impersonates the original author, so the author id is the webhook's.
+  const isAllowedWebhook = message.webhookId !== null;
+  if (message.author.bot && !isOwnRelay && !isAllowedWebhook && !ALLOWED_BOT_IDS.has(message.author.id)) return;
 
   const hasUrls = /https?:\/\/[^\s]+/.test(message.content);
 
