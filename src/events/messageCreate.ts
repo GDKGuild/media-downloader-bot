@@ -5,6 +5,9 @@ import { extractMediaFromMessage } from '../utils/mediaUtils';
 import { SessionLogger } from '../utils/sessionLogger';
 
 const AUTO_DOWNLOAD = process.env.AUTO_DOWNLOAD !== 'false';
+const ALLOWED_BOT_IDS = new Set(
+  (process.env.ALLOWED_BOT_IDS || '').split(',').map(id => id.trim()).filter(Boolean)
+);
 
 export async function handleMessageCreate(
   message: Message,
@@ -15,7 +18,7 @@ export async function handleMessageCreate(
   const isOwnRelay = message.author.bot
     && message.author.id === message.client.user?.id
     && /https?:\/\/[^\s]+\/status\/\d+/i.test(message.content);
-  if (message.author.bot && !isOwnRelay) return;
+  if (message.author.bot && !isOwnRelay && !ALLOWED_BOT_IDS.has(message.author.id)) return;
 
   const hasUrls = /https?:\/\/[^\s]+/.test(message.content);
 
