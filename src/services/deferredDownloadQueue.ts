@@ -25,6 +25,9 @@ export class DeferredDownloadQueue {
   }
 
   enqueue(entry: DeferredEntry): void {
+    // Idempotent: the watchdog re-scans recent messages on every tick.
+    const key = entryKey(entry);
+    if (this.list().some((e) => entryKey(e) === key)) return;
     const dir = path.dirname(this.filePath);
     fs.mkdirSync(dir, { recursive: true });
     const line = JSON.stringify(entry) + '\n';

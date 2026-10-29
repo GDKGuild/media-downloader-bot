@@ -171,7 +171,8 @@ export class DiscordFetchService {
       });
       if (onStatus) onStatus(statusMsg);
 
-      lastId = messageArray[0].id;
+      // `after` returns the oldest page first, so the newest id is the cursor
+      lastId = messageArray[messageArray.length - 1].id;
 
       await this.delay(1100);
     }

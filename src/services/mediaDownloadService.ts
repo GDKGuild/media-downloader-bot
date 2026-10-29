@@ -205,6 +205,10 @@ export class MediaDownloadService {
     this.renameLogger = new FolderRenameLogger(this.downloadDir);
   }
 
+  clearScrapeCache(): void {
+    this.scrapedUrls.clear();
+  }
+
   private resolveBaseDir(guildName: string, channelName: string, parentChannelName?: string): string {
     if (this.storageService) {
       return this.storageService.getBaseDir(guildName, channelName, parentChannelName);

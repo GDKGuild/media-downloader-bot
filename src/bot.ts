@@ -7,6 +7,7 @@ import { MegaService } from './services/megaService';
 import { DeferredDownloadQueue } from './services/deferredDownloadQueue';
 import { StorageService } from './services/storageService';
 import { TweetMonitorService } from './services/tweetMonitorService';
+import { DownloadWatchdog } from './services/watchdogService';
 import { MediaConfig, DownloadProgress } from './types';
 import { execute as downloadCommandExecute } from './commands/download';
 import { execute as cancelCommandExecute } from './commands/cancel';
@@ -26,6 +27,7 @@ const defaultMediaConfig: MediaConfig = {
 
 let currentStorageService: StorageService | undefined;
 let tweetMonitor: TweetMonitorService | undefined;
+let watchdog: DownloadWatchdog | undefined;
 
 export function getTweetMonitorService(): TweetMonitorService | undefined {
   return tweetMonitor;
@@ -36,6 +38,8 @@ export function disposeBot(): void {
   currentStorageService = undefined;
   tweetMonitor?.stop();
   tweetMonitor = undefined;
+  watchdog?.stop();
+  watchdog = undefined;
 }
 
 function logInteractionError(commandName: string, error: unknown): void {
@@ -94,6 +98,7 @@ export function createBot(): Client {
   }, DOWNLOAD_DIR, DOWNLOAD_RETRIES, megaService, deferredQueue, storageService);
 
   tweetMonitor = new TweetMonitorService(client, db);
+  watchdog = new DownloadWatchdog(client, fetchService, downloadService, defaultMediaConfig);
 
   if (megaService) {
     megaService.onConnect(() => {
@@ -133,6 +138,9 @@ export function createBot(): Client {
     }
     if (process.env.MONITOR_ENABLED !== 'false') {
       tweetMonitor?.start();
+    }
+    if (process.env.AUTO_DOWNLOAD !== 'false') {
+      watchdog?.start();
     }
   });
 
